@@ -252,6 +252,7 @@ class Sort(object):
       return np.concatenate(ret)
     return np.empty((0,5))
 
+
 def parse_args():
     """Parse input arguments."""
     parser = argparse.ArgumentParser(description='SORT demo')
@@ -267,6 +268,7 @@ def parse_args():
     parser.add_argument("--iou_threshold", help="Minimum IOU for match.", type=float, default=0.3)
     args = parser.parse_args()
     return args
+
 
 if __name__ == '__main__':
   # all train
@@ -328,3 +330,4 @@ if __name__ == '__main__':
 
   if(display):
     print("Note: to get real runtime results run without the option: --display")
+
