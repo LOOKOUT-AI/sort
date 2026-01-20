@@ -1,6 +1,5 @@
 output/
 mot_benchmark
-.venv
 MOT15
 
 # Python bytecode / caches

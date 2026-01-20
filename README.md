@@ -39,12 +39,12 @@ The entrypoint is `sort-3d.py` which runs `sort_ws/bridge.py`.
 
 ### Python + venv
 
-This repo expects you to use a local virtual environment in `.venv/`.
+This repo expects you to use a local virtual environment in `venv/`.
 
 ```bash
 cd /path/to/sort
-python -m venv .venv
-source .venv/bin/activate
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -69,15 +69,15 @@ Downstream defaults:
 ### Enter venv
 
 You can either:
-- activate the venv: `source .venv/bin/activate`, then run `python ...`, or
-- call the interpreter directly: `.venv/bin/python ...`
+- activate the venv: `source venv/bin/activate`, then run `python ...`, or
+- call the interpreter directly: `venv/bin/python ...`
 
 ### Image-space mode
 
 Image-space mode tracks directly in pixel coordinates using IOU (plus optional extra terms).
 
 ```bash
-.venv/bin/python sort-3d.py \
+venv/bin/python sort-3d.py \
   --mode image_space \
   --image-space-max-age 40 \
   --image-space-min-hits 300 \
@@ -122,7 +122,7 @@ We track in a local tangent plane (ENU = East/North in meters) instead of direct
   - `WorldSpaceSort` reads `world_east_m` / `world_north_m` and associates tracks using meter distances
 
 ```bash
-.venv/bin/python sort-3d.py \
+venv/bin/python sort-3d.py \
   --mode world_space \
   --world-space-cv-width-px 1920 \
   --world-space-fov-x-deg 55.3 \
@@ -183,14 +183,14 @@ The original upstream SORT demo is preserved under `sort_mot/`:
 Run the legacy demo (uses `data/train/*/det/det.txt`):
 
 ```bash
-.venv/bin/python sort_mot/sort.py
+venv/bin/python sort_mot/sort.py
 ```
 
 To display results, you must also have the MOT images available and symlinked to `mot_benchmark/` as expected by the script:
 
 ```bash
 ln -s /path/to/MOT2015_challenge/data/2DMOT2015 mot_benchmark
-.venv/bin/python sort_mot/sort.py --display
+venv/bin/python sort_mot/sort.py --display
 ```
 
 ## License
