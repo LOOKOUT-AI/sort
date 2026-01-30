@@ -124,8 +124,8 @@ def _track_image_space(bboxes: list, tracker: ImageSpaceSort) -> List[Dict[str, 
         if track_id is None:
             continue
         det2 = dict(det)
-        det2.setdefault("source_obj_id", det2.get("obj_id"))
-        det2["obj_id"] = int(track_id)
+        # Add track_id from SORT tracker; keep original obj_id as-is
+        det2["track_id"] = int(track_id)
         det2["tracked_space"] = "image_space"
         tracked_bboxes.append(det2)
     return tracked_bboxes
@@ -185,8 +185,8 @@ async def _track_world_space(
         if track_id is None:
             continue
         det2 = dict(det)
-        det2.setdefault("source_obj_id", det2.get("obj_id"))
-        det2["obj_id"] = int(track_id)
+        # Add track_id from SORT tracker; keep original obj_id as-is
+        det2["track_id"] = int(track_id)
         det2["tracked_space"] = "world_space"
         tracked_bboxes.append(det2)
     return tracked_bboxes
