@@ -38,7 +38,7 @@ The API outputs a unified track list with fused estimates, per-source raw data, 
 
 ## Architecture
 
-### Federated Fusion with Track-Level Association
+### Single KF Per Track with Multi-Source Updates
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -46,56 +46,96 @@ The API outputs a unified track list with fused estimates, per-source raw data, 
 ├──────────────┬──────────────┬──────────────┬──────────────┬─────────────┤
 │   CV Stream  │  AIS Stream  │ Radar Stream │ Chart Data   │  Ego NMEA   │
 │   (30 fps)   │  (2-10 sec)  │  (1-5 Hz)    │  (static)    │  (1-10 Hz)  │
+│   R = 100m²  │   R = 1m²    │   R = 25m²   │  (no KF)     │             │
 └──────┬───────┴──────┬───────┴──────┬───────┴──────┬───────┴──────┬──────┘
        │              │              │              │              │
-       ▼              ▼              ▼              │              ▼
-┌──────────────┬──────────────┬──────────────┐     │      ┌──────────────┐
-│   CV KF      │   AIS KF     │  Radar KF    │     │      │   Ego KF     │
-│ (per-track)  │ (per-MMSI)   │ (per-target) │     │      │  (smoother)  │
-└──────┬───────┴──────┬───────┴──────┬───────┘     │      └──────┬───────┘
+       │              │              │              │              ▼
+       │              │              │              │      ┌──────────────┐
+       │              │              │              │      │   Ego KF     │
+       │              │              │              │      │  (smoother)  │
+       │              │              │              │      └──────┬───────┘
        │              │              │              │              │
-       └──────────────┼──────────────┼──────────────┘              │
-                      ▼              ▼                             │
+       └──────────────┴──────────────┴──────────────┘              │
+                             │                                     │
+                             ▼                                     │
               ┌─────────────────────────────┐                      │
-              │   Track-to-Track Associator │◄─────────────────────┘
-              │   (spatial + ID matching)   │
+              │     ASSOCIATION LAYER       │◄─────────────────────┘
+              │  (Hungarian algorithm)      │
+              │  Match detections → tracks  │
               └──────────────┬──────────────┘
                              │
                              ▼
               ┌─────────────────────────────┐
-              │      Master Track List      │
-              │  (fused state + raw data)   │
+              │   SINGLE KF PER TRACK       │
+              │                             │
+              │  Sequential update with     │
+              │  source-specific R values:  │
+              │  - AIS: R = 1m² (trusted)   │
+              │  - Radar: R = 25m²          │
+              │  - CV: R = 100m² (noisy)    │
               └──────────────┬──────────────┘
                              │
-              ┌──────────────┼──────────────┐
-              ▼              ▼              ▼
-        ┌──────────┐  ┌──────────┐  ┌──────────┐
-        │ WebSocket│  │ WebSocket│  │   HTTP   │
-        │  (JSON)  │  │(MsgPack) │  │   REST   │
-        │  :5010   │  │  :5011   │  │  :8080   │
-        └──────────┘  └──────────┘  └──────────┘
+                             ▼
+              ┌─────────────────────────────┐
+              │      Fused Track List       │
+              │  (KF state + raw data)      │
+              └──────────────┬──────────────┘
+                             │
+        ┌────────────┬───────┼───────┬────────────┐
+        ▼            ▼       ▼       ▼            ▼
+  ┌──────────┐ ┌──────────┐ ┌────┐ ┌──────────┐ ┌──────────┐
+  │ WebSocket│ │ WebSocket│ │HTTP│ │  WebRTC  │ │  (future)│
+  │  (JSON)  │ │(MsgPack) │ │REST│ │ DataChan │ │  ROS 2   │
+  │  :5010   │ │  :5011   │ │8080│ │  :5013   │ │          │
+  └──────────┘ └──────────┘ └────┘ └──────────┘ └──────────┘
 ```
 
-**Why Federated Fusion:**
-- Each sensor has unique noise characteristics requiring separate Kalman filter tuning
-- Graceful degradation when sources are unavailable
-- Easier debugging (can inspect per-source estimates)
-- Supports enabling/disabling sources at runtime
+**Why Single KF Per Track:**
+- Simpler architecture, easier to maintain and debug
+- Avoids "double filtering" - AIS data is already GPS-quality and pre-smoothed
+- Source-specific measurement noise (R matrix) handles trust levels:
+  - AIS with very low R (1m²) → strongly corrects position
+  - CV with high R (100m²) → contributes but doesn't override AIS
+  - Radar with medium R (25m²) → useful when AIS unavailable
+- Sequential updates are mathematically equivalent regardless of order
+- High-rate CV maintains track between low-rate AIS updates
+
+**Update Flow (when multiple sources arrive):**
+```
+Frame k: CV detection + AIS message arrive
+
+1. PREDICT track state to time k
+2. ASSOCIATE: Match CV det → Track, Match AIS msg → Track (via MMSI or position)
+3. UPDATE sequentially (order doesn't matter for linear KF):
+   a. KF.update(cv_measurement, R=100m²)
+   b. KF.update(ais_measurement, R=1m²)    ← AIS will dominate due to low R
+4. Output fused state
+```
 
 ---
 
 ## Protocol & Transport
 
-### Recommended: WebSocket + JSON (Primary)
+### Protocol Comparison
 
-| Criterion | WebSocket | HTTP Polling | ROS 2 |
-|-----------|-----------|--------------|-------|
-| Latency | ~1-5 ms | ~50-100 ms | ~1-5 ms |
-| 30 fps capable | Yes | Marginal | Yes |
-| Browser support | Native | Native | Requires bridge |
-| Bidirectional | Yes | No | Yes |
-| Debug/Dev ease | Excellent | Good | Steeper curve |
-| Multi-client | Built-in | Server load | Native pub/sub |
+| Criterion | WebSocket | WebRTC DataChannel | HTTP Polling | ROS 2 |
+|-----------|-----------|-------------------|--------------|-------|
+| Latency | ~1-5 ms | ~1-5 ms | ~50-100 ms | ~1-5 ms |
+| 30 fps capable | Yes | Yes | Marginal | Yes |
+| Browser support | Native | Native | Native | Requires bridge |
+| Bidirectional | Yes | Yes | No | Yes |
+| NAT traversal | No (needs port forward) | Yes (STUN/TURN) | Yes | No |
+| P2P capable | No | Yes | No | No |
+| Debug/Dev ease | Excellent | Moderate | Good | Steeper curve |
+| Multi-client | Built-in broadcast | Per-peer channels | Server load | Native pub/sub |
+
+### Recommended Strategy
+
+- **WebSocket (JSON)**: Primary for development, debugging, browser clients on local network
+- **WebSocket (MessagePack)**: Production with bandwidth constraints
+- **WebRTC DataChannel**: Remote clients, NAT traversal, P2P scenarios
+- **HTTP REST**: Configuration, health checks, one-off queries
+- **ROS 2**: Future integration with robotics ecosystem
 
 ### Endpoints
 
@@ -104,9 +144,33 @@ The API outputs a unified track list with fused estimates, per-source raw data, 
 | `ws://host:5010/tracks` | WebSocket (JSON) | Real-time track stream |
 | `ws://host:5011/tracks` | WebSocket (MessagePack) | Efficient binary stream |
 | `ws://host:5012/control` | WebSocket (JSON) | Bidirectional config/commands |
+| `webrtc://host:5013` | WebRTC DataChannel | NAT-friendly track stream (JSON or binary) |
 | `http://host:8080/api/v1/config` | HTTP REST | GET/PUT configuration |
 | `http://host:8080/api/v1/health` | HTTP REST | Health check |
 | `http://host:8080/api/v1/tracks` | HTTP REST | Single snapshot (polling fallback) |
+| `http://host:8080/api/v1/webrtc/offer` | HTTP REST | WebRTC signaling endpoint |
+
+### WebRTC Integration
+
+WebRTC DataChannels provide:
+- **NAT traversal**: Works through firewalls without port forwarding
+- **Low latency**: Similar to WebSocket, but peer-to-peer when possible
+- **Reliable or unreliable**: Can choose ordered/reliable or unordered/unreliable delivery
+- **Browser native**: No additional libraries needed in modern browsers
+
+**Signaling flow:**
+```
+Client                          Server
+   │                               │
+   │──── HTTP POST /webrtc/offer ─►│  (SDP offer)
+   │◄─── HTTP 200 (SDP answer) ────│
+   │                               │
+   │◄─── ICE candidates ──────────►│  (via WebSocket or HTTP)
+   │                               │
+   │◄════ DataChannel established ═►│
+   │                               │
+   │◄─── Track updates (30 fps) ───│  (JSON or MessagePack)
+```
 
 ### Why JSON as Default
 
@@ -130,28 +194,21 @@ For local network and development, JSON's debuggability outweighs the bandwidth 
     "cv": {
       "enabled": true,
       "input_port": 5001,
-      "kf_params": {
-        "process_noise_position": 1.0,
-        "measurement_noise_position": 4.0,
-        "process_noise_velocity": 0.5
-      }
+      "measurement_noise_r_m2": 100.0,
+      "notes": "High R because CV distance estimates are noisy"
     },
     "ais": {
       "enabled": true,
       "input_port": 3636,
-      "kf_params": {
-        "process_noise_position": 0.1,
-        "measurement_noise_position": 1.0,
-        "trust_reported_cog_sog": true
-      }
+      "measurement_noise_r_m2": 1.0,
+      "trust_reported_cog_sog": true,
+      "notes": "Low R because AIS is GPS-quality and pre-smoothed"
     },
     "radar": {
       "enabled": false,
       "input_port": 4001,
-      "kf_params": {
-        "process_noise_position": 2.0,
-        "measurement_noise_position": 10.0
-      }
+      "measurement_noise_r_m2": 25.0,
+      "notes": "Medium R, range-dependent accuracy"
     },
     "chart": {
       "enabled": true,
@@ -171,7 +228,13 @@ For local network and development, JSON's debuggability outweighs the bandwidth 
     "max_age_frames": 300,
     "max_age_seconds": 10.0,
     "min_hits_to_confirm": 40,
-    "new_track_min_confidence": 0.5
+    "new_track_min_confidence": 0.5,
+    "kalman_filter": {
+      "process_noise_position_q": 1.0,
+      "process_noise_velocity_q": 0.5,
+      "initial_velocity_uncertainty": 1000.0,
+      "notes": "Single KF per track; R values are per-source (see sources config)"
+    }
   },
 
   "association": {
