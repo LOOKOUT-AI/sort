@@ -448,15 +448,10 @@ async def _downstream_control_handler(
                         pass
                     continue
                 if cmd == "get_playback_info":
-                    # Respond from cache if available, otherwise forward upstream
-                    cached_info = await playback_cache.get()
-                    if cached_info is not None:
-                        try:
-                            await ws.send(json.dumps({"playback_info": cached_info}))
-                        except Exception:
-                            pass
-                        continue
-                    # Fall through to forward upstream if no cached info
+                    # Always forward upstream so clients can refresh playback_info
+                    # (cache may be stale, e.g. total_frames=0 before video loads).
+                    await outbound_to_upstream.put(msg_s)
+                    continue
 
             await outbound_to_upstream.put(msg_s)
     finally:
