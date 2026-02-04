@@ -336,20 +336,39 @@ class ImageSpaceSort:
         
         return np.array([x, y, x2, y2], dtype=np.float32), extras
 
-    def assign(self, detections: List[Dict[str, Any]]) -> List[Optional[int]]:
+    def assign(self, detections: List[Dict[str, Any]]) -> Tuple[List[Optional[int]], List[Dict[str, Any]]]:
         """
-        Returns assigned track IDs for each detection (1-based IDs, like MOT format).
-        If there are no detections, returns [].
+        Returns a tuple of:
+          - assigned_ids: track IDs for each detection (1-based IDs, like MOT format), or None if not assigned
+          - unmatched_tracks: list of dicts for confirmed tracks that weren't matched this frame,
+                              containing predicted bbox and track metadata
         """
         self.frame_count += 1
 
         if len(detections) == 0:
             # Still age/predict existing trackers.
+            unmatched_tracks: List[Dict[str, Any]] = []
             to_del = []
             for t in range(len(self.trackers)):
                 pos = self.trackers[t].predict()[0]
                 if np.any(np.isnan(pos)):
                     to_del.append(t)
+                else:
+                    trk = self.trackers[t]
+                    # Output confirmed tracks that are now unmatched
+                    if trk.hits >= self.min_hits:
+                        x1, y1, x2, y2 = pos
+                        unmatched_tracks.append({
+                            "track_id": int(trk.id) + 1,
+                            "x": float(x1),
+                            "y": float(y1),
+                            "width": float(x2 - x1),
+                            "height": float(y2 - y1),
+                            "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
+                            "distance": float(trk.extras.distance) if not np.isnan(trk.extras.distance) else None,
+                            "heading": float(trk.extras.heading) if not np.isnan(trk.extras.heading) else None,
+                            "category": trk.extras.category,
+                        })
             for t in reversed(to_del):
                 self.trackers.pop(t)
             # Remove dead tracklets.
@@ -358,7 +377,7 @@ class ImageSpaceSort:
                 i -= 1
                 if trk.time_since_update > self.max_age:
                     self.trackers.pop(i)
-            return []
+            return [], unmatched_tracks
 
         det_xyxy = np.zeros((len(detections), 4), dtype=np.float32)
         det_dist = np.full((len(detections),), np.nan, dtype=np.float32)
@@ -394,7 +413,7 @@ class ImageSpaceSort:
             trk_heading = np.delete(trk_heading, t, axis=0)
             trk_conf = np.delete(trk_conf, t, axis=0)
 
-        matches, unmatched_dets, unmatched_trks = associate_detections_to_trackers(
+        matches, unmatched_dets, unmatched_trk_indices = associate_detections_to_trackers(
             det_xyxy,
             trks,
             det_dist,
@@ -409,14 +428,38 @@ class ImageSpaceSort:
         )
 
         assigned_ids: List[Optional[int]] = [None] * len(detections)
+        matched_trk_indices = set()
+        
+        # Tracks that matched a detection but are still "re-warming" (hit_streak < min_hits)
+        # These will be output as unmatched/ghost if they were previously confirmed (hits >= min_hits)
+        rewarming_tracks: List[Dict[str, Any]] = []
 
         # Update matched trackers with assigned detections.
         for det_idx, trk_idx in matches:
+            matched_trk_indices.add(int(trk_idx))
             self.trackers[int(trk_idx)].update(det_xyxy[int(det_idx), :], det_extras[int(det_idx)])
             trk = self.trackers[int(trk_idx)]
             track_id = int(trk.id) + 1
+            
             if trk.hit_streak >= self.min_hits:
+                # Fully confirmed with consecutive matches → output as matched
                 assigned_ids[int(det_idx)] = track_id
+            elif trk.hits > self.min_hits:
+                # Previously confirmed but re-warming (hit_streak < min_hits)
+                # → output as unmatched/ghost using the DETECTION position (not predicted)
+                det = detections[int(det_idx)]
+                rewarming_tracks.append({
+                    "track_id": track_id,
+                    "x": float(det.get("x", 0)),
+                    "y": float(det.get("y", 0)),
+                    "width": float(det.get("width", det.get("w", 0))),
+                    "height": float(det.get("height", det.get("h", 0))),
+                    "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
+                    "distance": float(trk.extras.distance) if not np.isnan(trk.extras.distance) else None,
+                    "heading": float(trk.extras.heading) if not np.isnan(trk.extras.heading) else None,
+                    "category": trk.extras.category,
+                })
+            # else: never confirmed (hits < min_hits), no output
 
         # Create and initialize new trackers for unmatched detections.
         for det_idx in unmatched_dets:
@@ -429,6 +472,29 @@ class ImageSpaceSort:
             if trk.hit_streak >= self.min_hits:
                 assigned_ids[int(det_idx)] = track_id
 
+        # Collect unmatched but confirmed tracks (predicted state)
+        unmatched_tracks: List[Dict[str, Any]] = []
+        for trk_idx in unmatched_trk_indices:
+            trk = self.trackers[int(trk_idx)]
+            # Only output tracks that have been confirmed (seen enough times)
+            if trk.hits >= self.min_hits:
+                pos = trks[int(trk_idx)]  # predicted bbox [x1, y1, x2, y2]
+                x1, y1, x2, y2 = pos
+                unmatched_tracks.append({
+                    "track_id": int(trk.id) + 1,
+                    "x": float(x1),
+                    "y": float(y1),
+                    "width": float(x2 - x1),
+                    "height": float(y2 - y1),
+                    "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
+                    "distance": float(trk.extras.distance) if not np.isnan(trk.extras.distance) else None,
+                    "heading": float(trk.extras.heading) if not np.isnan(trk.extras.heading) else None,
+                    "category": trk.extras.category,
+                })
+        
+        # Add re-warming tracks to unmatched output
+        unmatched_tracks.extend(rewarming_tracks)
+
         # Remove dead tracklets.
         i = len(self.trackers)
         for trk in reversed(self.trackers):
@@ -436,6 +502,6 @@ class ImageSpaceSort:
             if trk.time_since_update > self.max_age:
                 self.trackers.pop(i)
 
-        return assigned_ids
+        return assigned_ids, unmatched_tracks
 
 

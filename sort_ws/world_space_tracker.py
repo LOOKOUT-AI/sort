@@ -218,16 +218,36 @@ class WorldSpaceSort:
         extras = WorldTrackExtras(confidence=conf_f, category=det.get("category"), heading_deg=heading_f)
         return np.array([e, n], dtype=np.float32), extras
 
-    def assign(self, detections: List[Dict[str, Any]]) -> List[Optional[int]]:
+    def assign(self, detections: List[Dict[str, Any]]) -> Tuple[List[Optional[int]], List[Dict[str, Any]]]:
+        """
+        Returns a tuple of:
+          - assigned_ids: track IDs for each detection (1-based IDs), or None if not assigned
+          - unmatched_tracks: list of dicts for confirmed tracks that weren't matched this frame,
+                              containing predicted world position and track metadata
+        """
         self.frame_count += 1
 
         if len(detections) == 0:
             # age/predict existing trackers
+            unmatched_tracks: List[Dict[str, Any]] = []
             to_del: List[int] = []
             for t in range(len(self.trackers)):
                 pos = self.trackers[t].predict()
                 if np.any(np.isnan(pos)):
                     to_del.append(t)
+                else:
+                    trk = self.trackers[t]
+                    # Output confirmed tracks that are now unmatched
+                    if trk.hits >= self.min_hits:
+                        east, north = pos
+                        unmatched_tracks.append({
+                            "track_id": int(trk.id) + 1,
+                            "world_east_m": float(east),
+                            "world_north_m": float(north),
+                            "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
+                            "heading": float(trk.extras.heading_deg) if not np.isnan(trk.extras.heading_deg) else None,
+                            "category": trk.extras.category,
+                        })
             for t in reversed(to_del):
                 self.trackers.pop(t)
             # remove dead
@@ -236,7 +256,7 @@ class WorldSpaceSort:
                 i -= 1
                 if trk.time_since_update > self.max_age:
                     self.trackers.pop(i)
-            return []
+            return [], unmatched_tracks
 
         det_xy = np.zeros((len(detections), 2), dtype=np.float32)
         det_heading = np.full((len(detections),), np.nan, dtype=np.float32)
@@ -266,7 +286,7 @@ class WorldSpaceSort:
             trk_heading = np.delete(trk_heading, t, axis=0)
             trk_conf = np.delete(trk_conf, t, axis=0)
 
-        matches, unmatched_dets, _unmatched_trks = associate_world_detections_to_trackers(
+        matches, unmatched_dets, unmatched_trk_indices = associate_world_detections_to_trackers(
             det_xy,
             trk_xy,
             det_heading,
@@ -278,13 +298,34 @@ class WorldSpaceSort:
         )
 
         assigned: List[Optional[int]] = [None] * len(detections)
+        matched_trk_indices = set()
+        
+        # Tracks that matched a detection but are still "re-warming" (hit_streak < min_hits)
+        # These will be output as unmatched/ghost if they were previously confirmed (hits >= min_hits)
+        rewarming_tracks: List[Dict[str, Any]] = []
 
         for det_idx, trk_idx in matches:
+            matched_trk_indices.add(int(trk_idx))
             self.trackers[int(trk_idx)].update(det_xy[int(det_idx), :], det_extras[int(det_idx)])
             trk = self.trackers[int(trk_idx)]
             track_id = int(trk.id) + 1
+            
             if trk.hit_streak >= self.min_hits:
+                # Fully confirmed with consecutive matches → output as matched
                 assigned[int(det_idx)] = track_id
+            elif trk.hits > self.min_hits:
+                # Previously confirmed but re-warming (hit_streak < min_hits)
+                # → output as unmatched/ghost using the DETECTION position (not predicted)
+                det = detections[int(det_idx)]
+                rewarming_tracks.append({
+                    "track_id": track_id,
+                    "world_east_m": float(det.get("world_east_m", 0)),
+                    "world_north_m": float(det.get("world_north_m", 0)),
+                    "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
+                    "heading": float(trk.extras.heading_deg) if not np.isnan(trk.extras.heading_deg) else None,
+                    "category": trk.extras.category,
+                })
+            # else: never confirmed (hits < min_hits), no output
 
         for det_idx in unmatched_dets:
             conf = float(det_extras[int(det_idx)].confidence)
@@ -296,6 +337,26 @@ class WorldSpaceSort:
             if trk.hit_streak >= self.min_hits:
                 assigned[int(det_idx)] = track_id
 
+        # Collect unmatched but confirmed tracks (predicted state)
+        unmatched_tracks: List[Dict[str, Any]] = []
+        for trk_idx in unmatched_trk_indices:
+            trk = self.trackers[int(trk_idx)]
+            # Only output tracks that have been confirmed (seen enough times)
+            if trk.hits >= self.min_hits:
+                pos = trk_xy[int(trk_idx)]  # predicted position [east, north]
+                east, north = pos
+                unmatched_tracks.append({
+                    "track_id": int(trk.id) + 1,
+                    "world_east_m": float(east),
+                    "world_north_m": float(north),
+                    "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
+                    "heading": float(trk.extras.heading_deg) if not np.isnan(trk.extras.heading_deg) else None,
+                    "category": trk.extras.category,
+                })
+        
+        # Add re-warming tracks to unmatched output
+        unmatched_tracks.extend(rewarming_tracks)
+
         # remove dead
         i = len(self.trackers)
         for trk in reversed(self.trackers):
@@ -303,5 +364,5 @@ class WorldSpaceSort:
             if trk.time_since_update > self.max_age:
                 self.trackers.pop(i)
 
-        return assigned
+        return assigned, unmatched_tracks
 

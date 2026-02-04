@@ -15,7 +15,7 @@ from .codec import decode_video_message, encode_video_message
 from .ego import EgoSmoother, EgoStateStore
 from .image_space_tracker import ImageSpaceSort
 from .world_space_tracker import WorldSpaceSort
-from .world_transform import detection_to_world_latlon
+from .world_transform import detection_to_world_latlon, enu_to_latlon, ENU
 
 
 @dataclass(frozen=True)
@@ -109,14 +109,34 @@ class TrackingModeState:
             return self._mode
 
 
+class PlaybackInfoCache:
+    """
+    Cache for playback_info from upstream, so newly connected clients can receive it.
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._playback_info: Optional[Dict[str, Any]] = None
+
+    async def update(self, playback_info: Dict[str, Any]) -> None:
+        async with self._lock:
+            self._playback_info = playback_info
+
+    async def get(self) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            return self._playback_info
+
+
 def _ws_url(host: str, port: int) -> str:
     return f"ws://{host}:{port}"
 
 
 def _track_image_space(bboxes: list, tracker: ImageSpaceSort) -> List[Dict[str, Any]]:
-    assigned = tracker.assign(bboxes)
+    assigned_ids, unmatched_tracks = tracker.assign(bboxes)
     tracked_bboxes: List[Dict[str, Any]] = []
-    for det, track_id in zip(bboxes, assigned):
+    
+    # Process matched detections
+    for det, track_id in zip(bboxes, assigned_ids):
         if not isinstance(det, dict):
             continue
         # If the detection isn't confirmed by the tracker yet, drop it entirely.
@@ -127,7 +147,16 @@ def _track_image_space(bboxes: list, tracker: ImageSpaceSort) -> List[Dict[str, 
         # Add track_id from SORT tracker; keep original obj_id as-is
         det2["track_id"] = int(track_id)
         det2["tracked_space"] = "image_space"
+        det2["tracked_status"] = "matched"
         tracked_bboxes.append(det2)
+    
+    # Process unmatched but confirmed tracks (predicted state)
+    for unmatched in unmatched_tracks:
+        det2 = dict(unmatched)
+        det2["tracked_space"] = "image_space"
+        det2["tracked_status"] = "unmatched"
+        tracked_bboxes.append(det2)
+    
     return tracked_bboxes
 
 
@@ -179,16 +208,33 @@ async def _track_world_space(
         det2["world_rel_ego_north_m"] = float(enu_rel_ego.north_m)
         world_dets.append(det2)
 
-    assigned = world_tracker.assign(world_dets)
+    assigned_ids, unmatched_tracks = world_tracker.assign(world_dets)
     tracked_bboxes: List[Dict[str, Any]] = []
-    for det, track_id in zip(world_dets, assigned):
+    
+    # Process matched detections
+    for det, track_id in zip(world_dets, assigned_ids):
         if track_id is None:
             continue
         det2 = dict(det)
         # Add track_id from SORT tracker; keep original obj_id as-is
         det2["track_id"] = int(track_id)
         det2["tracked_space"] = "world_space"
+        det2["tracked_status"] = "matched"
         tracked_bboxes.append(det2)
+    
+    # Process unmatched but confirmed tracks (predicted state)
+    for unmatched in unmatched_tracks:
+        # Convert ENU position back to lat/lon
+        enu = ENU(east_m=unmatched["world_east_m"], north_m=unmatched["world_north_m"])
+        latlon = enu_to_latlon(local_ref, enu)
+        
+        det2 = dict(unmatched)
+        det2["world_latitude"] = float(latlon.lat)
+        det2["world_longitude"] = float(latlon.lon)
+        det2["tracked_space"] = "world_space"
+        det2["tracked_status"] = "unmatched"
+        tracked_bboxes.append(det2)
+    
     return tracked_bboxes
 
 async def _upstream_video_loop(
@@ -290,7 +336,10 @@ async def _upstream_nmea_loop(
 
 
 async def _upstream_control_loop(
-    cfg: BridgeConfig, control_hub: BroadcastHub, outbound_to_upstream: "asyncio.Queue[str]"
+    cfg: BridgeConfig,
+    control_hub: BroadcastHub,
+    outbound_to_upstream: "asyncio.Queue[str]",
+    playback_cache: PlaybackInfoCache,
 ) -> None:
     url = _ws_url(cfg.upstream_host, cfg.upstream_control_port)
     while True:
@@ -306,6 +355,13 @@ async def _upstream_control_loop(
                 sender_task = asyncio.create_task(sender())
                 try:
                     async for msg in upstream:
+                        # Cache playback_info for newly connecting clients
+                        try:
+                            obj = json.loads(msg)
+                            if isinstance(obj, dict) and "playback_info" in obj:
+                                await playback_cache.update(obj["playback_info"])
+                        except Exception:
+                            pass
                         await control_hub.broadcast(msg)
                 finally:
                     sender_task.cancel()
@@ -340,12 +396,21 @@ async def _downstream_control_handler(
     control_hub: BroadcastHub,
     outbound_to_upstream: "asyncio.Queue[str]",
     mode_state: TrackingModeState,
+    playback_cache: PlaybackInfoCache,
 ) -> None:
     await control_hub.register(ws)
     try:
         # Send current mode to newly connected clients.
         try:
             await ws.send(json.dumps({"tracking_mode": await mode_state.get()}))
+        except Exception:
+            pass
+
+        # Send cached playback_info to newly connected clients.
+        try:
+            cached_info = await playback_cache.get()
+            if cached_info is not None:
+                await ws.send(json.dumps({"playback_info": cached_info}))
         except Exception:
             pass
 
@@ -382,6 +447,16 @@ async def _downstream_control_handler(
                     except Exception:
                         pass
                     continue
+                if cmd == "get_playback_info":
+                    # Respond from cache if available, otherwise forward upstream
+                    cached_info = await playback_cache.get()
+                    if cached_info is not None:
+                        try:
+                            await ws.send(json.dumps({"playback_info": cached_info}))
+                        except Exception:
+                            pass
+                        continue
+                    # Fall through to forward upstream if no cached info
 
             await outbound_to_upstream.put(msg_s)
     finally:
@@ -399,6 +474,7 @@ async def run_bridge(
     control_hub = BroadcastHub("control")
     outbound_to_upstream: asyncio.Queue[str] = asyncio.Queue()
     mode_state = TrackingModeState(cfg.mode)
+    playback_cache = PlaybackInfoCache()
 
     # Start downstream servers and keep the returned server objects alive.
     video_server = await websockets.serve(
@@ -414,7 +490,7 @@ async def run_bridge(
         max_size=None,
     )
     control_server = await websockets.serve(
-        lambda ws: _downstream_control_handler(ws, control_hub, outbound_to_upstream, mode_state),
+        lambda ws: _downstream_control_handler(ws, control_hub, outbound_to_upstream, mode_state, playback_cache),
         cfg.downstream_bind,
         cfg.downstream_control_port,
         max_size=None,
@@ -433,7 +509,7 @@ async def run_bridge(
         await asyncio.gather(
             _upstream_video_loop(cfg, mode_state, image_tracker, world_tracker, ego_store, video_hub),
             _upstream_nmea_loop(cfg, nmea_hub, ego_store),
-            _upstream_control_loop(cfg, control_hub, outbound_to_upstream),
+            _upstream_control_loop(cfg, control_hub, outbound_to_upstream, playback_cache),
         )
     finally:
         video_server.close()
