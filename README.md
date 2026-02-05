@@ -31,7 +31,7 @@ We are **not** using MOTChallenge evaluation in day-to-day work here.
 Instead, we use this repository to:
 - consume a video stream with detection metadata (per frame),
 - run a tracker to turn “frame detections” into “stable object IDs”, and
-- re-broadcast the same stream with `obj_id` replaced by the tracker ID.
+- re-broadcast the same stream with stable `track_id` on each bbox and `obj_id` preserved from upstream (original detection ID).
 
 The entrypoint is `sort-3d.py` which runs `sort_ws/bridge.py`.
 
@@ -89,9 +89,9 @@ venv/bin/python sort-3d.py \
 - **optional**: `confidence`, `distance`, `heading`, `category`
 
 **Output behavior**:
-- only “confirmed” tracks are forwarded (unconfirmed detections are dropped)
-- `obj_id` becomes the tracker ID, and original `obj_id` is preserved as `source_obj_id`
-- outgoing metadata includes `tracked_space="image_space"`
+- both matched and unmatched confirmed tracks are output every frame (unconfirmed detections are dropped)
+- each bbox has `track_id` (stable tracker ID) and, for matched bboxes, `obj_id` (original upstream detection ID)
+- outgoing metadata includes `tracked_space="image_space"` and `tracked_status` (`"matched"` or `"unmatched"`)
 
 ### World-space mode
 
@@ -135,8 +135,96 @@ venv/bin/python sort-3d.py \
 - video metadata bboxes must include `distance` (meters) and pixel `x/width` so the bridge can compute bearing
 
 **Output behavior**:
-- adds world fields to each bbox (e.g. `world_latitude/world_longitude`, `world_east_m/world_north_m`, etc.)
-- outgoing metadata includes `tracked_space="world_space"`
+- both matched and unmatched confirmed tracks are output every frame
+- each bbox has `track_id` (stable tracker ID) and, for matched bboxes, `obj_id` (original upstream detection ID)
+- world fields are added (e.g. `world_latitude/world_longitude`, `world_east_m/world_north_m`, etc.); unmatched tracks get back-projected bbox fields for AR view
+- outgoing metadata includes `tracked_space="world_space"` and `tracked_status` (`"matched"` or `"unmatched"`)
+
+### Tracker output structure
+
+Both trackers now output **matched** and **unmatched** confirmed tracks every frame. Unmatched tracks are confirmed tracks that weren't associated with a detection this frame but are still within `max_age`. This allows downstream consumers (e.g., lookout-V2 AR view) to continue displaying tracks even when detections are temporarily missing.
+
+#### Output mode selection logic
+
+The `--mode` parameter controls which tracker's output is used:
+
+- **`image_space`**: Only outputs image-space tracks (matched + unmatched). World-space tracker still runs internally but its output is discarded.
+- **`world_space`**: Only outputs world-space tracks (matched + unmatched). May output empty list until first ego fix arrives.
+- **`auto`** (default): If world-space tracks are non-empty, outputs only world-space tracks; otherwise outputs only image-space tracks. This provides a seamless fallback when ego data is unavailable.
+
+#### Output fields by tracker and match status
+
+Each output bbox includes a `tracked_status` field:
+- `"matched"` — track was associated with a detection this frame
+- `"unmatched"` — confirmed track with no detection this frame (using predicted/stored values)
+
+##### 1. Image-space tracker, matched
+
+All original detection fields are preserved, plus tracker metadata:
+
+| Field | Source |
+|-------|--------|
+| `x`, `y`, `width`, `height` | From detection (pixels) |
+| `confidence`, `distance`, `heading`, `category` | From detection |
+| `obj_id` | From detection (original upstream ID) |
+| `track_id` | Stable tracker ID (1-based) |
+| `tracked_space` | `"image_space"` |
+| `tracked_status` | `"matched"` |
+
+##### 2. Image-space tracker, unmatched
+
+Uses Kalman-predicted bbox and last known metadata:
+
+| Field | Source |
+|-------|--------|
+| `x`, `y`, `width`, `height` | Kalman-predicted bbox (pixels) |
+| `confidence`, `distance`, `heading`, `category` | Last known values from most recent match |
+| `track_id` | Stable tracker ID (1-based) |
+| `tracked_space` | `"image_space"` |
+| `tracked_status` | `"unmatched"` |
+
+##### 3. World-space tracker, matched
+
+All original detection fields plus computed world fields:
+
+| Field | Source |
+|-------|--------|
+| `x`, `y`, `width`, `height` | From detection (pixels) |
+| `confidence`, `distance`, `heading`, `category` | From detection |
+| `obj_id` | From detection (original upstream ID) |
+| `world_latitude`, `world_longitude` | Computed from ego + bearing + distance |
+| `world_east_m`, `world_north_m` | ENU meters from local reference |
+| `world_rel_ego_east_m`, `world_rel_ego_north_m` | ENU meters relative to current ego |
+| `track_id` | Stable tracker ID (1-based) |
+| `tracked_space` | `"world_space"` |
+| `tracked_status` | `"matched"` |
+
+##### 4. World-space tracker, unmatched
+
+Uses Kalman-predicted world position, with **artificially computed bbox fields** for AR view synchronization:
+
+| Field | Source |
+|-------|--------|
+| `x` | Back-projected from world position (`x_center - width/2`) |
+| `y` | Stored last known value from most recent match |
+| `width`, `height` | Stored last known values from most recent match |
+| `distance` | Back-projected from world position |
+| `confidence`, `heading`, `category` | Last known values from most recent match |
+| `world_latitude`, `world_longitude` | Converted from predicted ENU |
+| `world_east_m`, `world_north_m` | Kalman-predicted position (ENU meters) |
+| `world_rel_ego_east_m`, `world_rel_ego_north_m` | Recomputed relative to current ego |
+| `track_id` | Stable tracker ID (1-based) |
+| `tracked_space` | `"world_space"` |
+| `tracked_status` | `"unmatched"` |
+
+#### Why compute artificial bbox for unmatched world-space tracks?
+
+The lookout-V2 frontend AR view needs bbox coordinates to display overlays synchronized with the Aerial View. When a world-space track goes unmatched (no detection this frame), we back-project the Kalman-predicted world position to image space using:
+
+1. `world_to_image.py::world_to_image_space()` computes `x_center_px` and `distance` from the predicted world position
+2. Stored `y`, `width`, `height` from the last matched detection are reused (vertical position and size don't change much frame-to-frame)
+
+This allows the AR view to continue showing a bbox overlay for the track even when the detector misses the object.
 
 ### Parameters (what they mean)
 
