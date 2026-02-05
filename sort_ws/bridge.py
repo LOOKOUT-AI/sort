@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import sys
 from dataclasses import dataclass
 from typing import Optional, Set, List, Dict, Any
@@ -15,7 +16,8 @@ from .codec import decode_video_message, encode_video_message
 from .ego import EgoSmoother, EgoStateStore
 from .image_space_tracker import ImageSpaceSort
 from .world_space_tracker import WorldSpaceSort
-from .world_transform import detection_to_world_latlon, enu_to_latlon, ENU
+from .image_to_world import detection_to_world_latlon, enu_to_latlon, ENU
+from .world_to_image import world_to_image_space
 
 
 @dataclass(frozen=True)
@@ -228,11 +230,42 @@ async def _track_world_space(
         enu = ENU(east_m=unmatched["world_east_m"], north_m=unmatched["world_north_m"])
         latlon = enu_to_latlon(local_ref, enu)
         
+        # Back-project world position to image space, to construct artificial computed bboxes, for AR view to display alongside Aerial View
+        x_center_px, distance_m, enu_rel_ego = world_to_image_space(
+            world_east_m=unmatched["world_east_m"],
+            world_north_m=unmatched["world_north_m"],
+            ego_latlon=ego.latlon,
+            ego_heading_deg=float(ego.heading_deg),
+            image_width_px=float(cfg.world_space_cv_width_px),
+            fov_x_rad=fov_x_rad,
+            camera_yaw_offset_deg=float(cfg.world_space_camera_yaw_offset_deg),
+            local_ref=local_ref,
+        )
+        
         det2 = dict(unmatched)
         det2["world_latitude"] = float(latlon.lat)
         det2["world_longitude"] = float(latlon.lon)
         det2["tracked_space"] = "world_space"
         det2["tracked_status"] = "unmatched"
+        
+        # Add back-projected image-space fields using stored bbox geometry
+        last_y = unmatched.get("last_y_px")
+        last_width = unmatched.get("last_width_px")
+        last_height = unmatched.get("last_height_px")
+        
+        # Use stored values or defaults
+        y_px = float(last_y) if last_y is not None and not math.isnan(last_y) else 0.0
+        width_px = float(last_width) if last_width is not None and not math.isnan(last_width) else 50.0
+        height_px = float(last_height) if last_height is not None and not math.isnan(last_height) else 50.0
+        
+        det2["x"] = float(x_center_px - width_px / 2.0)
+        det2["y"] = y_px
+        det2["width"] = width_px
+        det2["height"] = height_px
+        det2["distance"] = float(distance_m)
+        det2["world_rel_ego_east_m"] = float(enu_rel_ego.east_m)
+        det2["world_rel_ego_north_m"] = float(enu_rel_ego.north_m)
+        
         tracked_bboxes.append(det2)
     
     return tracked_bboxes

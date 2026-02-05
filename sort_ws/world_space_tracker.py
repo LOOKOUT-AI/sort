@@ -8,7 +8,7 @@ import numpy as np
 from filterpy.kalman import KalmanFilter
 
 from .image_space_tracker import linear_assignment  # reuse lap/scipy wrapper
-from .world_transform import heading_diff_deg
+from .image_to_world import heading_diff_deg
 
 
 @dataclass
@@ -16,6 +16,10 @@ class WorldTrackExtras:
     confidence: float = float("nan")
     category: Optional[str] = None
     heading_deg: float = float("nan")  # if the detector provides a target heading estimate
+    # Store last known bbox geometry for back-projection of unmatched tracks
+    last_y_px: float = float("nan")
+    last_width_px: float = float("nan")
+    last_height_px: float = float("nan")
 
 
 class KalmanPointTracker:
@@ -215,7 +219,27 @@ class WorldSpaceSort:
             heading_f = float(heading)
         except Exception:
             heading_f = float("nan")
-        extras = WorldTrackExtras(confidence=conf_f, category=det.get("category"), heading_deg=heading_f)
+        # Extract bbox geometry for back-projection of unmatched tracks
+        try:
+            y_px = float(det.get("y", float("nan")))
+        except Exception:
+            y_px = float("nan")
+        try:
+            width_px = float(det.get("width", det.get("w", float("nan"))))
+        except Exception:
+            width_px = float("nan")
+        try:
+            height_px = float(det.get("height", det.get("h", float("nan"))))
+        except Exception:
+            height_px = float("nan")
+        extras = WorldTrackExtras(
+            confidence=conf_f,
+            category=det.get("category"),
+            heading_deg=heading_f,
+            last_y_px=y_px,
+            last_width_px=width_px,
+            last_height_px=height_px,
+        )
         return np.array([e, n], dtype=np.float32), extras
 
     def assign(self, detections: List[Dict[str, Any]]) -> Tuple[List[Optional[int]], List[Dict[str, Any]]]:
@@ -247,6 +271,10 @@ class WorldSpaceSort:
                             "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
                             "heading": float(trk.extras.heading_deg) if not np.isnan(trk.extras.heading_deg) else None,
                             "category": trk.extras.category,
+                            # Bbox geometry for back-projection
+                            "last_y_px": float(trk.extras.last_y_px) if not np.isnan(trk.extras.last_y_px) else None,
+                            "last_width_px": float(trk.extras.last_width_px) if not np.isnan(trk.extras.last_width_px) else None,
+                            "last_height_px": float(trk.extras.last_height_px) if not np.isnan(trk.extras.last_height_px) else None,
                         })
             for t in reversed(to_del):
                 self.trackers.pop(t)
@@ -324,6 +352,10 @@ class WorldSpaceSort:
                     "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
                     "heading": float(trk.extras.heading_deg) if not np.isnan(trk.extras.heading_deg) else None,
                     "category": trk.extras.category,
+                    # Bbox geometry for back-projection (from current detection)
+                    "last_y_px": float(det.get("y")) if det.get("y") is not None else None,
+                    "last_width_px": float(det.get("width", det.get("w"))) if det.get("width", det.get("w")) is not None else None,
+                    "last_height_px": float(det.get("height", det.get("h"))) if det.get("height", det.get("h")) is not None else None,
                 })
             # else: never confirmed (hits < min_hits), no output
 
@@ -352,6 +384,10 @@ class WorldSpaceSort:
                     "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
                     "heading": float(trk.extras.heading_deg) if not np.isnan(trk.extras.heading_deg) else None,
                     "category": trk.extras.category,
+                    # Bbox geometry for back-projection
+                    "last_y_px": float(trk.extras.last_y_px) if not np.isnan(trk.extras.last_y_px) else None,
+                    "last_width_px": float(trk.extras.last_width_px) if not np.isnan(trk.extras.last_width_px) else None,
+                    "last_height_px": float(trk.extras.last_height_px) if not np.isnan(trk.extras.last_height_px) else None,
                 })
         
         # Add re-warming tracks to unmatched output

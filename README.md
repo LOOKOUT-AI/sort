@@ -110,7 +110,7 @@ We track in a local tangent plane (ENU = East/North in meters) instead of direct
 
 #### Where the ENU conversion happens
 
-- **Detection → ENU (relative meters)**: `sort_ws/world_transform.py`:
+- **Detection → ENU (relative meters)**: `sort_ws/image_to_world.py`:
   - `pixel_x_to_bearing_rad()` and `camera_relative_xy_m()` convert pixel x + range to (right_m, forward_m)
   - `right_fwd_to_enu_m()` converts (right/forward) into ENU using ego heading
   - `detection_to_world_latlon()` returns:
@@ -171,7 +171,7 @@ venv/bin/python sort-3d.py \
 
 ### Tracking + transforms
 - **`sort_ws/image_space_tracker.py`**: image-space SORT-style tracker (`ImageSpaceSort`) + IOU association + Hungarian assignment (with optional extra cost terms).
-- **`sort_ws/world_transform.py`**: math utilities to project pixels + distance into ENU meters and back to lat/lon.
+- **`sort_ws/image_to_world.py`**: math utilities to project pixels + distance into ENU meters and back to lat/lon.
 - **`sort_ws/ego.py`**: ego state smoothing and storage; consumes NMEA JSON, maintains a smoothed `EgoState` (lat/lon/heading and local ENU).
 - **`sort_ws/world_space_tracker.py`**: world-space SORT-style tracker (`WorldSpaceSort`) that tracks points in ENU meters.
 
