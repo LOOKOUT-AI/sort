@@ -343,20 +343,12 @@ class WorldSpaceSort:
                 assigned[int(det_idx)] = track_id
             elif trk.hits > self.min_hits:
                 # Previously confirmed but re-warming (hit_streak < min_hits)
-                # → output as unmatched/ghost using the DETECTION position (not predicted)
+                # → pass through the FULL DETECTION dict directly (no back-projection needed)
                 det = detections[int(det_idx)]
-                rewarming_tracks.append({
-                    "track_id": track_id,
-                    "world_east_m": float(det.get("world_east_m", 0)),
-                    "world_north_m": float(det.get("world_north_m", 0)),
-                    "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
-                    "heading": float(trk.extras.heading_deg) if not np.isnan(trk.extras.heading_deg) else None,
-                    "category": trk.extras.category,
-                    # Bbox geometry for back-projection (from current detection)
-                    "last_y_px": float(det.get("y")) if det.get("y") is not None else None,
-                    "last_width_px": float(det.get("width", det.get("w"))) if det.get("width", det.get("w")) is not None else None,
-                    "last_height_px": float(det.get("height", det.get("h"))) if det.get("height", det.get("h")) is not None else None,
-                })
+                rewarming_entry = dict(det)  # Copy all detection fields (x, y, w, h, distance, confidence, obj_id, etc.)
+                rewarming_entry["track_id"] = track_id
+                rewarming_entry["_is_rewarming"] = True  # Marker for bridge to skip back-projection
+                rewarming_tracks.append(rewarming_entry)
             # else: never confirmed (hits < min_hits), no output
 
         for det_idx in unmatched_dets:

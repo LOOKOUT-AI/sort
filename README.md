@@ -158,6 +158,108 @@ Each output bbox includes a `tracked_status` field:
 - `"matched"` — track was associated with a detection this frame
 - `"unmatched"` — confirmed track with no detection this frame (using predicted/stored values)
 
+#### Track output decision tree
+
+The tracker uses two counters to decide whether to output a track:
+
+- **`hits`**: total lifetime matches (cumulative, never resets)
+- **`hit_streak`**: consecutive matches (resets to 0 on any missed frame)
+
+```
+                        Track exists
+                             |
+            +----------------+----------------+
+            |                                 |
+    Detection matched?                 No detection matched
+            |                                 |
+   hit_streak >= min_hits?            hits >= min_hits?
+            |                                 |
+      +-----+-----+                     +-----+-----+
+      |           |                     |           |
+     YES         NO                    YES         NO
+      |           |                     |           |
+   OUTPUT    hits > min_hits?        OUTPUT      NOT
+   MATCHED        |                  UNMATCHED   OUTPUT
+            +-----+-----+            (ghost)
+            |           |
+           YES         NO
+            |           |
+         OUTPUT       NOT
+        UNMATCHED    OUTPUT
+        (re-warm)   (warming)
+```
+
+**State definitions:**
+
+| State | Condition | Meaning |
+|-------|-----------|---------|
+| **Matched** | `hit_streak >= min_hits` | Track has enough consecutive matches to be fully confirmed |
+| **Re-warming** | `hit_streak < min_hits` but `hits > min_hits` | Track was previously confirmed but lost consecutive matches; still outputs as unmatched using detection position |
+| **Unmatched (ghost)** | No detection this frame, but `hits >= min_hits` | Confirmed track with no detection; outputs using Kalman prediction |
+| **Warming** | `hits < min_hits` | New track building confidence; not yet output |
+
+**Position source by state:**
+
+| Track State | Position Source |
+|-------------|-----------------|
+| Matched | Detection position |
+| Re-warming | Detection position (not Kalman prediction) |
+| Unmatched (ghost) | Kalman filter prediction |
+
+**Why re-warming uses detection position:**
+
+When a previously-confirmed track matches a detection but hasn't yet rebuilt its `hit_streak` to `min_hits`, we use the detection position rather than the Kalman prediction. This is because:
+1. We have a fresh detection — use it
+2. The Kalman prediction may have drifted during the missed frames
+3. Re-warming tracks are output as `"unmatched"` status so downstream knows they're not fully re-confirmed yet
+
+#### Track lifecycle and deletion
+
+A track is created when an unmatched detection spawns a new tracker. The track uses a third counter:
+
+- **`time_since_update`**: frames since last matched detection (resets to 0 on match, increments on each predict)
+
+**Track deletion rule:** A track is permanently deleted when `time_since_update > max_age`.
+
+```
+Track created (unmatched detection)
+         |
+         v
+    [Warming phase: hits < min_hits]
+         |
+    hit_streak >= min_hits?
+         |
+    +----+----+
+    |         |
+   YES       NO (missed frames)
+    |         |
+    v         v
+ [Confirmed] time_since_update > max_age?
+    |              |
+    |         +----+----+
+    |         |         |
+    |        NO        YES
+    |         |         |
+    |    [Continue]  [DELETED]
+    |    (as ghost)
+    v
+ [Outputs as matched/unmatched/ghost]
+```
+
+**Summary: when is a track NOT output?**
+
+| Condition | Result |
+|-----------|--------|
+| `hits < min_hits` (warming) | Not output — still building confidence |
+| `time_since_update > max_age` | Track deleted — gone forever |
+
+**Summary: when IS a track output?**
+
+Once `hits >= min_hits` (i.e., the track was confirmed at some point), the track will be output every frame until it's deleted. The output status depends on the current frame:
+- **Matched**: detection matched AND `hit_streak >= min_hits`
+- **Unmatched (re-warming)**: detection matched BUT `hit_streak < min_hits`
+- **Unmatched (ghost)**: no detection matched this frame
+
 ##### 1. Image-space tracker, matched
 
 All original detection fields are preserved, plus tracker metadata:
@@ -201,30 +303,55 @@ All original detection fields plus computed world fields:
 
 ##### 4. World-space tracker, unmatched
 
-Uses Kalman-predicted world position, with **artificially computed bbox fields** for AR view synchronization:
+Tracks with `tracked_status="unmatched"` include two sub-cases with different position sources:
+
+**4a. Ghost tracks (no detection this frame)**
+
+Uses Kalman-predicted world position + stored bbox geometry:
 
 | Field | Source |
 |-------|--------|
-| `x` | Back-projected from world position (`x_center - width/2`) |
-| `y` | Stored last known value from most recent match |
-| `width`, `height` | Stored last known values from most recent match |
-| `distance` | Back-projected from world position |
-| `confidence`, `heading`, `category` | Last known values from most recent match |
+| `world_east_m`, `world_north_m` | **Kalman-predicted** position (ENU meters) |
+| `x` | Back-projected from predicted world position |
+| `y`, `width`, `height` | **Stored** from most recent matched detection |
+| `distance` | Back-projected from predicted world position |
 | `world_latitude`, `world_longitude` | Converted from predicted ENU |
-| `world_east_m`, `world_north_m` | Kalman-predicted position (ENU meters) |
 | `world_rel_ego_east_m`, `world_rel_ego_north_m` | Recomputed relative to current ego |
+| `confidence`, `heading`, `category` | Last known values |
 | `track_id` | Stable tracker ID (1-based) |
 | `tracked_space` | `"world_space"` |
 | `tracked_status` | `"unmatched"` |
 
-#### Why compute artificial bbox for unmatched world-space tracks?
+**4b. Re-warming tracks (detection matched, but hit_streak < min_hits)**
 
-The lookout-V2 frontend AR view needs bbox coordinates to display overlays synchronized with the Aerial View. When a world-space track goes unmatched (no detection this frame), we back-project the Kalman-predicted world position to image space using:
+**Passes through the full detection directly** — no back-projection needed since we have the actual detection:
 
-1. `world_to_image.py::world_to_image_space()` computes `x_center_px` and `distance` from the predicted world position
-2. Stored `y`, `width`, `height` from the last matched detection are reused (vertical position and size don't change much frame-to-frame)
+| Field | Source |
+|-------|--------|
+| `x`, `y`, `width`, `height` | **Directly from current detection** (exact values) |
+| `distance` | **Directly from current detection** |
+| `confidence`, `heading`, `category` | **Directly from current detection** |
+| `obj_id` | **Directly from current detection** (preserved!) |
+| `world_east_m`, `world_north_m` | From current detection |
+| `world_latitude`, `world_longitude` | From current detection |
+| `world_rel_ego_east_m`, `world_rel_ego_north_m` | From current detection |
+| `track_id` | Stable tracker ID (1-based) |
+| `tracked_space` | `"world_space"` |
+| `tracked_status` | `"unmatched"` |
 
-This allows the AR view to continue showing a bbox overlay for the track even when the detector misses the object.
+**Why re-warming tracks pass through detection directly**: Re-warming tracks have a matched detection this frame — they're only "unmatched" in terms of not having enough consecutive hits yet. Since we have fresh detection data, we use it directly instead of back-projecting from world position. This preserves all original fields including `obj_id`, avoids round-trip precision loss, and uses current confidence/heading/category values.
+
+#### Why compute artificial bbox for ghost tracks?
+
+Ghost tracks (true unmatched — no detection this frame) need artificial bbox computation because the world tracker only maintains ENU position, not pixel coordinates. The lookout-V2 AR view needs bbox coordinates to display overlays synchronized with the Aerial View.
+
+For **ghost tracks only**, we back-project world position to image space:
+1. `world_to_image.py::world_to_image_space()` computes `x_center_px` and `distance` from the Kalman-predicted world position
+2. Stored `y`, `width`, `height` from the last matched detection are reused
+
+For **re-warming tracks**, no back-projection is needed — we pass through the detection data directly.
+
+This allows the AR view to continue showing a bbox overlay for the track even when the detector completely misses the object (ghost tracks).
 
 ### Parameters (what they mean)
 
