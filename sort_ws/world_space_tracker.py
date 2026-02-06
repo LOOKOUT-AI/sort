@@ -22,9 +22,9 @@ class WorldTrackExtras:
     last_height_px: float = float("nan")
 
 
-class KalmanPointTracker:
+class KalmanCVPointTracker:
     """
-    Track a single target in world space (local ENU meters), using a constant-velocity KF.
+    Track a single target in world space (local ENU meters), using a constant-velocity (CV) KF.
 
     State: [east, north, ve, vn]
     Measurement: [east, north]
@@ -52,8 +52,98 @@ class KalmanPointTracker:
         self.kf.x = np.array([[float(meas_enu[0])], [float(meas_enu[1])], [0.0], [0.0]], dtype=np.float32)
 
         self.time_since_update = 0
-        self.id = KalmanPointTracker.count
-        KalmanPointTracker.count += 1
+        self.id = KalmanCVPointTracker.count
+        KalmanCVPointTracker.count += 1
+        self.hits = 1
+        self.hit_streak = 1
+        self.age = 0
+        self.extras = extras
+
+    def update(self, meas_enu: np.ndarray, extras: WorldTrackExtras) -> None:
+        self.time_since_update = 0
+        self.hits += 1
+        self.hit_streak += 1
+        z = np.array([[float(meas_enu[0])], [float(meas_enu[1])]], dtype=np.float32)
+        self.kf.update(z)
+        self.extras = extras
+
+    def predict(self) -> np.ndarray:
+        self.kf.predict()
+        self.age += 1
+        if self.time_since_update > 0:
+            self.hit_streak = 0
+        self.time_since_update += 1
+        return self.get_state()
+
+    def get_state(self) -> np.ndarray:
+        # return [east, north]
+        return self.kf.x[:2, 0].astype(np.float32)
+
+
+class KalmanCAPointTracker:
+    """
+    Track a single target in world space (local ENU meters), using a constant-acceleration (CA) KF.
+
+    State: [east, north, ve, vn, ae, an]
+    Measurement: [east, north]
+    """
+
+    count = 0
+
+    def __init__(self, meas_enu: np.ndarray, extras: WorldTrackExtras):
+        self.kf = KalmanFilter(dim_x=6, dim_z=2)
+        dt = 1.0
+        # fmt: off
+        self.kf.F = np.array(
+            [[1, 0, dt, 0,  dt**2/2, 0      ],
+             [0, 1, 0,  dt, 0,       dt**2/2],
+             [0, 0, 1,  0,  dt,      0      ],
+             [0, 0, 0,  1,  0,       dt     ],
+             [0, 0, 0,  0,  1,       0      ],
+             [0, 0, 0,  0,  0,       1      ]],
+            dtype=np.float32,
+        )
+        self.kf.H = np.array(
+            [[1, 0, 0, 0, 0, 0],
+             [0, 1, 0, 0, 0, 0]],
+            dtype=np.float32,
+        )
+        # fmt: on
+
+        # Measurement noise: same sensor as CV, same R.
+        self.kf.R = np.eye(2, dtype=np.float32) * 4.0
+
+        # Initial state covariance.
+        self.kf.P = np.eye(6, dtype=np.float32) * 10.0
+        self.kf.P[2:4, 2:4] *= 1000.0   # velocities initially very uncertain
+        self.kf.P[4:6, 4:6] *= 10000.0   # accelerations even more uncertain
+
+        # Process noise: driven by jerk (white noise) as the unmodeled disturbance.
+        # Per-axis noise gain: G = [dt^3/6, dt^2/2, dt]
+        # Q_axis = q_jerk * G @ G^T, then interleaved for (east, north).
+        q_jerk = 1.0
+        g = np.array([dt**3 / 6.0, dt**2 / 2.0, dt], dtype=np.float32)
+        q_axis = q_jerk * np.outer(g, g)  # 3x3
+        # Assemble 6x6 block-diagonal Q for [e, n, ve, vn, ae, an] ordering
+        # East indices: 0, 2, 4  |  North indices: 1, 3, 5
+        self.kf.Q = np.zeros((6, 6), dtype=np.float32)
+        east_idx = [0, 2, 4]
+        north_idx = [1, 3, 5]
+        for i_s, i_full in enumerate(east_idx):
+            for j_s, j_full in enumerate(east_idx):
+                self.kf.Q[i_full, j_full] = q_axis[i_s, j_s]
+        for i_s, i_full in enumerate(north_idx):
+            for j_s, j_full in enumerate(north_idx):
+                self.kf.Q[i_full, j_full] = q_axis[i_s, j_s]
+
+        self.kf.x = np.array(
+            [[float(meas_enu[0])], [float(meas_enu[1])], [0.0], [0.0], [0.0], [0.0]],
+            dtype=np.float32,
+        )
+
+        self.time_since_update = 0
+        self.id = KalmanCAPointTracker.count
+        KalmanCAPointTracker.count += 1
         self.hits = 1
         self.hit_streak = 1
         self.age = 0
@@ -194,6 +284,7 @@ class WorldSpaceSort:
         world_space_beta_heading: float = 0.0,
         world_space_gamma_confidence: float = 0.0,
         world_space_new_track_min_confidence: float = 0.0,
+        world_space_kf_model: str = "cv",
     ):
         # Keep attribute names short/stable for runtime introspection/logging.
         self.max_age = int(world_space_max_age)
@@ -203,7 +294,13 @@ class WorldSpaceSort:
         self.gamma_confidence = float(world_space_gamma_confidence)
         self.new_track_min_confidence = float(world_space_new_track_min_confidence)
 
-        self.trackers: List[KalmanPointTracker] = []
+        kf_model = str(world_space_kf_model).strip().lower()
+        if kf_model not in ("cv", "ca"):
+            raise ValueError(f"Unknown KF model '{world_space_kf_model}', expected 'cv' or 'ca'")
+        self.kf_model = kf_model
+        self._tracker_class = KalmanCAPointTracker if kf_model == "ca" else KalmanCVPointTracker
+
+        self.trackers: list = []
         self.frame_count = 0
 
     def _det_to_xy(self, det: Dict[str, Any]) -> Tuple[np.ndarray, WorldTrackExtras]:
@@ -355,7 +452,7 @@ class WorldSpaceSort:
             conf = float(det_extras[int(det_idx)].confidence)
             if not np.isnan(conf) and conf < self.new_track_min_confidence:
                 continue
-            trk = KalmanPointTracker(det_xy[int(det_idx), :], det_extras[int(det_idx)])
+            trk = self._tracker_class(det_xy[int(det_idx), :], det_extras[int(det_idx)])
             self.trackers.append(trk)
             track_id = int(trk.id) + 1
             if trk.hit_streak >= self.min_hits:

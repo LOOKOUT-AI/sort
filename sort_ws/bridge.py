@@ -652,6 +652,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
     )
+    p.add_argument(
+        "--world-space-kf-model",
+        dest="world_space_kf_model",
+        type=str,
+        default="cv",
+        choices=["cv", "ca"],
+        help='Kalman filter motion model for world-space tracker. "cv" = constant velocity (4-state), "ca" = constant acceleration (6-state).',
+    )
 
     p.add_argument(
         "--log-every-n-frames",
@@ -702,7 +710,9 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         world_space_beta_heading=args.world_space_beta_heading,
         world_space_gamma_confidence=args.world_space_gamma_confidence,
         world_space_new_track_min_confidence=args.world_space_new_track_min_confidence,
+        world_space_kf_model=args.world_space_kf_model,
     )
+    print(f"[sort-ws] World-space KF model: {args.world_space_kf_model}")
 
     try:
         asyncio.run(run_bridge(cfg, image_tracker, world_tracker, ego_store))
