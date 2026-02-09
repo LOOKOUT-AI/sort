@@ -79,6 +79,23 @@ class KalmanCVPointTracker:
         # return [east, north]
         return self.kf.x[:2, 0].astype(np.float32)
 
+    def get_full_state(self) -> Dict[str, float]:
+        """Return full KF state as a dict: position, velocity, and convenience scalars."""
+        x = self.kf.x.flatten()
+        east, north, ve, vn = float(x[0]), float(x[1]), float(x[2]), float(x[3])
+        speed = math.hypot(ve, vn)
+        course = math.degrees(math.atan2(ve, vn)) % 360.0  # 0=N, 90=E
+        return {
+            "east_m": east,
+            "north_m": north,
+            "vel_east_mps": ve,
+            "vel_north_mps": vn,
+            "speed_mps": speed,
+            "course_deg": course,
+            "accel_east_mps2": None,
+            "accel_north_mps2": None,
+        }
+
 
 class KalmanCAPointTracker:
     """
@@ -168,6 +185,25 @@ class KalmanCAPointTracker:
     def get_state(self) -> np.ndarray:
         # return [east, north]
         return self.kf.x[:2, 0].astype(np.float32)
+
+    def get_full_state(self) -> Dict[str, float]:
+        """Return full KF state as a dict: position, velocity, acceleration, and convenience scalars."""
+        x = self.kf.x.flatten()
+        east, north = float(x[0]), float(x[1])
+        ve, vn = float(x[2]), float(x[3])
+        ae, an = float(x[4]), float(x[5])
+        speed = math.hypot(ve, vn)
+        course = math.degrees(math.atan2(ve, vn)) % 360.0  # 0=N, 90=E
+        return {
+            "east_m": east,
+            "north_m": north,
+            "vel_east_mps": ve,
+            "vel_north_mps": vn,
+            "speed_mps": speed,
+            "course_deg": course,
+            "accel_east_mps2": ae,
+            "accel_north_mps2": an,
+        }
 
 
 def _euclid_dist_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -339,12 +375,14 @@ class WorldSpaceSort:
         )
         return np.array([e, n], dtype=np.float32), extras
 
-    def assign(self, detections: List[Dict[str, Any]]) -> Tuple[List[Optional[int]], List[Dict[str, Any]]]:
+    def assign(self, detections: List[Dict[str, Any]]) -> Tuple[List[Optional[int]], List[Dict[str, Any]], Dict[int, Dict[str, Any]]]:
         """
         Returns a tuple of:
           - assigned_ids: track IDs for each detection (1-based IDs), or None if not assigned
           - unmatched_tracks: list of dicts for confirmed tracks that weren't matched this frame,
-                              containing predicted world position and track metadata
+                              containing predicted world position, full KF state, and track metadata
+          - matched_track_states: dict mapping track_id -> full KF state dict (from get_full_state())
+                                  for every matched and confirmed track this frame
         """
         self.frame_count += 1
 
@@ -360,11 +398,11 @@ class WorldSpaceSort:
                     trk = self.trackers[t]
                     # Output confirmed tracks that are now unmatched
                     if trk.hits >= self.min_hits:
-                        east, north = pos
-                        unmatched_tracks.append({
+                        full_state = trk.get_full_state()
+                        entry: Dict[str, Any] = {
                             "track_id": int(trk.id) + 1,
-                            "world_east_m": float(east),
-                            "world_north_m": float(north),
+                            "world_east_m": full_state["east_m"],
+                            "world_north_m": full_state["north_m"],
                             "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
                             "heading": float(trk.extras.heading_deg) if not np.isnan(trk.extras.heading_deg) else None,
                             "category": trk.extras.category,
@@ -372,7 +410,15 @@ class WorldSpaceSort:
                             "last_y_px": float(trk.extras.last_y_px) if not np.isnan(trk.extras.last_y_px) else None,
                             "last_width_px": float(trk.extras.last_width_px) if not np.isnan(trk.extras.last_width_px) else None,
                             "last_height_px": float(trk.extras.last_height_px) if not np.isnan(trk.extras.last_height_px) else None,
-                        })
+                            # Full KF kinematic state
+                            "vel_east_mps": full_state["vel_east_mps"],
+                            "vel_north_mps": full_state["vel_north_mps"],
+                            "speed_mps": full_state["speed_mps"],
+                            "course_deg": full_state["course_deg"],
+                            "accel_east_mps2": full_state["accel_east_mps2"],
+                            "accel_north_mps2": full_state["accel_north_mps2"],
+                        }
+                        unmatched_tracks.append(entry)
             for t in reversed(to_del):
                 self.trackers.pop(t)
             # remove dead
@@ -381,7 +427,7 @@ class WorldSpaceSort:
                 i -= 1
                 if trk.time_since_update > self.max_age:
                     self.trackers.pop(i)
-            return [], unmatched_tracks
+            return [], unmatched_tracks, {}
 
         det_xy = np.zeros((len(detections), 2), dtype=np.float32)
         det_heading = np.full((len(detections),), np.nan, dtype=np.float32)
@@ -424,6 +470,7 @@ class WorldSpaceSort:
 
         assigned: List[Optional[int]] = [None] * len(detections)
         matched_trk_indices = set()
+        matched_track_states: Dict[int, Dict[str, Any]] = {}
         
         # Tracks that matched a detection but are still "re-warming" (hit_streak < min_hits)
         # These will be output as unmatched/ghost if they were previously confirmed (hits >= min_hits)
@@ -438,6 +485,7 @@ class WorldSpaceSort:
             if trk.hit_streak >= self.min_hits:
                 # Fully confirmed with consecutive matches → output as matched
                 assigned[int(det_idx)] = track_id
+                matched_track_states[track_id] = trk.get_full_state()
             elif trk.hits > self.min_hits:
                 # Previously confirmed but re-warming (hit_streak < min_hits)
                 # → pass through the FULL DETECTION dict directly (no back-projection needed)
@@ -445,6 +493,14 @@ class WorldSpaceSort:
                 rewarming_entry = dict(det)  # Copy all detection fields (x, y, w, h, distance, confidence, obj_id, etc.)
                 rewarming_entry["track_id"] = track_id
                 rewarming_entry["_is_rewarming"] = True  # Marker for bridge to skip back-projection
+                # Include full KF state for rewarming tracks
+                full_state = trk.get_full_state()
+                rewarming_entry["vel_east_mps"] = full_state["vel_east_mps"]
+                rewarming_entry["vel_north_mps"] = full_state["vel_north_mps"]
+                rewarming_entry["speed_mps"] = full_state["speed_mps"]
+                rewarming_entry["course_deg"] = full_state["course_deg"]
+                rewarming_entry["accel_east_mps2"] = full_state["accel_east_mps2"]
+                rewarming_entry["accel_north_mps2"] = full_state["accel_north_mps2"]
                 rewarming_tracks.append(rewarming_entry)
             # else: never confirmed (hits < min_hits), no output
 
@@ -464,12 +520,11 @@ class WorldSpaceSort:
             trk = self.trackers[int(trk_idx)]
             # Only output tracks that have been confirmed (seen enough times)
             if trk.hits >= self.min_hits:
-                pos = trk_xy[int(trk_idx)]  # predicted position [east, north]
-                east, north = pos
+                full_state = trk.get_full_state()
                 unmatched_tracks.append({
                     "track_id": int(trk.id) + 1,
-                    "world_east_m": float(east),
-                    "world_north_m": float(north),
+                    "world_east_m": full_state["east_m"],
+                    "world_north_m": full_state["north_m"],
                     "confidence": float(trk.extras.confidence) if not np.isnan(trk.extras.confidence) else 0.5,
                     "heading": float(trk.extras.heading_deg) if not np.isnan(trk.extras.heading_deg) else None,
                     "category": trk.extras.category,
@@ -477,6 +532,13 @@ class WorldSpaceSort:
                     "last_y_px": float(trk.extras.last_y_px) if not np.isnan(trk.extras.last_y_px) else None,
                     "last_width_px": float(trk.extras.last_width_px) if not np.isnan(trk.extras.last_width_px) else None,
                     "last_height_px": float(trk.extras.last_height_px) if not np.isnan(trk.extras.last_height_px) else None,
+                    # Full KF kinematic state
+                    "vel_east_mps": full_state["vel_east_mps"],
+                    "vel_north_mps": full_state["vel_north_mps"],
+                    "speed_mps": full_state["speed_mps"],
+                    "course_deg": full_state["course_deg"],
+                    "accel_east_mps2": full_state["accel_east_mps2"],
+                    "accel_north_mps2": full_state["accel_north_mps2"],
                 })
         
         # Add re-warming tracks to unmatched output
@@ -489,5 +551,5 @@ class WorldSpaceSort:
             if trk.time_since_update > self.max_age:
                 self.trackers.pop(i)
 
-        return assigned, unmatched_tracks
+        return assigned, unmatched_tracks, matched_track_states
 

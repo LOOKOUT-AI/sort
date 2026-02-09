@@ -210,8 +210,12 @@ async def _track_world_space(
         det2["world_rel_ego_north_m"] = float(enu_rel_ego.north_m)
         world_dets.append(det2)
 
-    assigned_ids, unmatched_tracks = world_tracker.assign(world_dets)
+    assigned_ids, unmatched_tracks, matched_track_states = world_tracker.assign(world_dets)
     tracked_bboxes: List[Dict[str, Any]] = []
+
+    # ENU reference point (same for all tracks, set once per session)
+    enu_ref_lat = float(local_ref.lat)
+    enu_ref_lon = float(local_ref.lon)
     
     # Process matched detections
     for det, track_id in zip(world_dets, assigned_ids):
@@ -222,6 +226,18 @@ async def _track_world_space(
         det2["track_id"] = int(track_id)
         det2["tracked_space"] = "world_space"
         det2["tracked_status"] = "matched"
+        # ENU reference point
+        det2["enu_ref_lat"] = enu_ref_lat
+        det2["enu_ref_lon"] = enu_ref_lon
+        # Merge full KF kinematic state (velocity, acceleration, speed, course)
+        kf_state = matched_track_states.get(int(track_id))
+        if kf_state:
+            det2["vel_east_mps"] = kf_state["vel_east_mps"]
+            det2["vel_north_mps"] = kf_state["vel_north_mps"]
+            det2["speed_mps"] = kf_state["speed_mps"]
+            det2["course_deg"] = kf_state["course_deg"]
+            det2["accel_east_mps2"] = kf_state["accel_east_mps2"]
+            det2["accel_north_mps2"] = kf_state["accel_north_mps2"]
         tracked_bboxes.append(det2)
     
     # Process unmatched but confirmed tracks (ghost tracks and re-warming tracks)
@@ -232,11 +248,14 @@ async def _track_world_space(
         if is_rewarming:
             # Re-warming track: use detection data directly (no back-projection needed)
             # The detection already has x, y, width, height, distance, confidence, heading, category, obj_id, etc.
+            # KF kinematic state fields (vel_*, speed_mps, etc.) already included by assign().
             det2 = dict(unmatched)
             det2.pop("_is_rewarming", None)  # Remove internal marker
             det2["tracked_space"] = "world_space"
             det2["tracked_status"] = "unmatched"
             det2["unmatched_status"] = "rewarming"
+            det2["enu_ref_lat"] = enu_ref_lat
+            det2["enu_ref_lon"] = enu_ref_lon
             tracked_bboxes.append(det2)
         else:
             # Ghost track: back-project world position to image space
@@ -261,6 +280,9 @@ async def _track_world_space(
             det2["tracked_space"] = "world_space"
             det2["tracked_status"] = "unmatched"
             det2["unmatched_status"] = "ghost"
+            det2["enu_ref_lat"] = enu_ref_lat
+            det2["enu_ref_lon"] = enu_ref_lon
+            # KF kinematic state fields (vel_*, speed_mps, etc.) already included by assign().
             
             # Add back-projected image-space fields using stored bbox geometry
             last_y = unmatched.get("last_y_px")
