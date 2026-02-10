@@ -709,34 +709,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help='Kalman filter motion model for world-space tracker. "cv" = constant velocity (4-state), "ca" = constant acceleration (6-state).',
     )
 
-    # Per-category kinematic caps (negative = disabled, 0 = clamp to zero)
+    # Per-category kinematic caps (always active; use a large value to effectively uncap)
     p.add_argument(
         "--world-space-max-speed-boat-mps",
         dest="world_space_max_speed_boat_mps",
         type=float,
-        default=-1.0,
-        help="Max speed cap for 'boat' category tracks (m/s). Negative = disabled, 0 = clamp velocity to zero.",
+        default=50.0,
+        help="Max speed cap for 'boat' category tracks (m/s). 0 = clamp velocity to zero. Use a large value (e.g. 1000) to effectively uncap.",
     )
     p.add_argument(
         "--world-space-max-speed-other-mps",
         dest="world_space_max_speed_other_mps",
         type=float,
-        default=-1.0,
-        help="Max speed cap for non-boat category tracks (m/s). Negative = disabled, 0 = clamp velocity to zero.",
+        default=50.0,
+        help="Max speed cap for non-boat category tracks (m/s). 0 = clamp velocity to zero. Use a large value (e.g. 1000) to effectively uncap.",
     )
     p.add_argument(
         "--world-space-max-accel-boat-mps2",
         dest="world_space_max_accel_boat_mps2",
         type=float,
-        default=-1.0,
-        help="Max acceleration cap for 'boat' category tracks (m/s²). Only used with CA model. Negative = disabled, 0 = clamp acceleration to zero.",
+        default=20.0,
+        help="Max acceleration cap for 'boat' category tracks (m/s²). Only used with CA model. 0 = clamp acceleration to zero. Use a large value (e.g. 100) to effectively uncap.",
     )
     p.add_argument(
         "--world-space-max-accel-other-mps2",
         dest="world_space_max_accel_other_mps2",
         type=float,
-        default=-1.0,
-        help="Max acceleration cap for non-boat category tracks (m/s²). Only used with CA model. Negative = disabled, 0 = clamp acceleration to zero.",
+        default=20.0,
+        help="Max acceleration cap for non-boat category tracks (m/s²). Only used with CA model. 0 = clamp acceleration to zero. Use a large value (e.g. 100) to effectively uncap.",
     )
 
     p.add_argument(
@@ -795,10 +795,8 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         world_space_max_accel_other_mps2=args.world_space_max_accel_other_mps2,
     )
     print(f"[sort-ws] World-space KF model: {args.world_space_kf_model}")
-    if args.world_space_max_speed_boat_mps >= 0 or args.world_space_max_speed_other_mps >= 0:
-        print(f"[sort-ws] Speed caps: boat={args.world_space_max_speed_boat_mps} m/s, other={args.world_space_max_speed_other_mps} m/s")
-    if args.world_space_max_accel_boat_mps2 >= 0 or args.world_space_max_accel_other_mps2 >= 0:
-        print(f"[sort-ws] Accel caps: boat={args.world_space_max_accel_boat_mps2} m/s², other={args.world_space_max_accel_other_mps2} m/s²")
+    print(f"[sort-ws] Speed caps: boat={args.world_space_max_speed_boat_mps} m/s, other={args.world_space_max_speed_other_mps} m/s")
+    print(f"[sort-ws] Accel caps: boat={args.world_space_max_accel_boat_mps2} m/s², other={args.world_space_max_accel_other_mps2} m/s²")
 
     try:
         asyncio.run(run_bridge(cfg, image_tracker, world_tracker, ego_store))

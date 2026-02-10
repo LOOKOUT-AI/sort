@@ -14,13 +14,11 @@ from .image_to_world import heading_diff_deg
 def _clamp_vector(vx: float, vy: float, vmax: float) -> Tuple[float, float]:
     """Clamp 2D vector magnitude to *vmax*, preserving direction.
 
-    *vmax* < 0 disables the clamp (pass-through).
-    *vmax* == 0 zeroes the vector.
-    *vmax* > 0 caps magnitude while keeping direction.
+    Always active.  *vmax* == 0 zeroes the vector; *vmax* > 0 caps
+    magnitude while keeping direction.  Set a large value (e.g. 1000)
+    if you effectively don't want a constraint.
     """
-    if vmax < 0.0:
-        return vx, vy
-    if vmax == 0.0:
+    if vmax <= 0.0:
         return 0.0, 0.0
     mag = math.hypot(vx, vy)
     if mag <= vmax or mag < 1e-12:
@@ -55,10 +53,10 @@ class KalmanCVPointTracker:
         meas_enu: np.ndarray,
         extras: WorldTrackExtras,
         *,
-        max_speed_boat_mps: float = -1.0,
-        max_speed_other_mps: float = -1.0,
-        max_accel_boat_mps2: float = -1.0,   # accepted but unused (CV has no accel state)
-        max_accel_other_mps2: float = -1.0,  # accepted but unused
+        max_speed_boat_mps: float = 50.0,
+        max_speed_other_mps: float = 50.0,
+        max_accel_boat_mps2: float = 20.0,   # accepted but unused (CV has no accel state)
+        max_accel_other_mps2: float = 20.0,  # accepted but unused
     ):
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
         dt = 1.0
@@ -86,7 +84,7 @@ class KalmanCVPointTracker:
         self.age = 0
         self.extras = extras
 
-        # Per-category speed caps (negative = disabled, 0 = clamp to zero)
+        # Per-category speed caps (always active; use a large value to effectively uncap)
         self.max_speed_boat_mps = float(max_speed_boat_mps)
         self.max_speed_other_mps = float(max_speed_other_mps)
 
@@ -102,12 +100,11 @@ class KalmanCVPointTracker:
     def _clamp_state(self) -> None:
         """Clamp velocity to the category-specific max speed, preserving direction."""
         max_speed = self._resolve_max_speed()
-        if max_speed >= 0.0:
-            x = self.kf.x
-            ve, vn = float(x[2, 0]), float(x[3, 0])
-            ve_c, vn_c = _clamp_vector(ve, vn, max_speed)
-            x[2, 0] = ve_c
-            x[3, 0] = vn_c
+        x = self.kf.x
+        ve, vn = float(x[2, 0]), float(x[3, 0])
+        ve_c, vn_c = _clamp_vector(ve, vn, max_speed)
+        x[2, 0] = ve_c
+        x[3, 0] = vn_c
 
     def update(self, meas_enu: np.ndarray, extras: WorldTrackExtras) -> None:
         self.time_since_update = 0
@@ -163,10 +160,10 @@ class KalmanCAPointTracker:
         meas_enu: np.ndarray,
         extras: WorldTrackExtras,
         *,
-        max_speed_boat_mps: float = -1.0,
-        max_speed_other_mps: float = -1.0,
-        max_accel_boat_mps2: float = -1.0,
-        max_accel_other_mps2: float = -1.0,
+        max_speed_boat_mps: float = 50.0,
+        max_speed_other_mps: float = 50.0,
+        max_accel_boat_mps2: float = 20.0,
+        max_accel_other_mps2: float = 20.0,
     ):
         self.kf = KalmanFilter(dim_x=6, dim_z=2)
         dt = 1.0
@@ -226,7 +223,7 @@ class KalmanCAPointTracker:
         self.age = 0
         self.extras = extras
 
-        # Per-category speed / acceleration caps (negative = disabled, 0 = clamp to zero)
+        # Per-category speed / acceleration caps (always active; use a large value to effectively uncap)
         self.max_speed_boat_mps = float(max_speed_boat_mps)
         self.max_speed_other_mps = float(max_speed_other_mps)
         self.max_accel_boat_mps2 = float(max_accel_boat_mps2)
@@ -247,16 +244,14 @@ class KalmanCAPointTracker:
         """Clamp velocity and acceleration to category-specific maxima, preserving direction."""
         max_speed, max_accel = self._resolve_limits()
         x = self.kf.x
-        if max_speed >= 0.0:
-            ve, vn = float(x[2, 0]), float(x[3, 0])
-            ve_c, vn_c = _clamp_vector(ve, vn, max_speed)
-            x[2, 0] = ve_c
-            x[3, 0] = vn_c
-        if max_accel >= 0.0:
-            ae, an = float(x[4, 0]), float(x[5, 0])
-            ae_c, an_c = _clamp_vector(ae, an, max_accel)
-            x[4, 0] = ae_c
-            x[5, 0] = an_c
+        ve, vn = float(x[2, 0]), float(x[3, 0])
+        ve_c, vn_c = _clamp_vector(ve, vn, max_speed)
+        x[2, 0] = ve_c
+        x[3, 0] = vn_c
+        ae, an = float(x[4, 0]), float(x[5, 0])
+        ae_c, an_c = _clamp_vector(ae, an, max_accel)
+        x[4, 0] = ae_c
+        x[5, 0] = an_c
 
     def update(self, meas_enu: np.ndarray, extras: WorldTrackExtras) -> None:
         self.time_since_update = 0
@@ -414,11 +409,11 @@ class WorldSpaceSort:
         world_space_gamma_confidence: float = 0.0,
         world_space_new_track_min_confidence: float = 0.0,
         world_space_kf_model: str = "cv",
-        # Per-category kinematic caps (negative = disabled / unclamped, 0 = clamp to zero).
-        world_space_max_speed_boat_mps: float = -1.0,
-        world_space_max_speed_other_mps: float = -1.0,
-        world_space_max_accel_boat_mps2: float = -1.0,
-        world_space_max_accel_other_mps2: float = -1.0,
+        # Per-category kinematic caps (always active; use a large value to effectively uncap).
+        world_space_max_speed_boat_mps: float = 50.0,
+        world_space_max_speed_other_mps: float = 50.0,
+        world_space_max_accel_boat_mps2: float = 20.0,
+        world_space_max_accel_other_mps2: float = 20.0,
     ):
         # Keep attribute names short/stable for runtime introspection/logging.
         self.max_age = int(world_space_max_age)

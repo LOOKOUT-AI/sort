@@ -401,12 +401,12 @@ This allows the AR view to continue showing a bbox overlay for the track even wh
 
 These cap the KF state to physically reasonable values, preventing tracks from "flying away" during occlusions or noisy detections. Clamping is applied after every KF predict step (not after update), preserving direction while capping magnitude.
 
-Sentinel convention: **negative** = disabled (no clamping), **0** = clamp to zero (e.g., force stationary), **positive** = cap at that value. Default: `-1` (disabled).
+The clamp is always active. **0** = clamp to zero (e.g., force stationary), **positive** = cap at that value. Set a large value (e.g. `50` for speed, `20` for acceleration) if you effectively don't want a constraint.
 
-- **`--world-space-max-speed-boat-mps`**: max speed for `boat` category tracks (m/s). Velocity vector magnitude is clamped to this value. Default: `-1` (disabled).
-- **`--world-space-max-speed-other-mps`**: max speed for non-boat category tracks (m/s). Default: `-1` (disabled).
-- **`--world-space-max-accel-boat-mps2`**: max acceleration for `boat` category tracks (m/s²). Only effective with the CA model. Default: `-1` (disabled).
-- **`--world-space-max-accel-other-mps2`**: max acceleration for non-boat category tracks (m/s²). Only effective with the CA model. Default: `-1` (disabled).
+- **`--world-space-max-speed-boat-mps`**: max speed for `boat` category tracks (m/s). Velocity vector magnitude is clamped to this value. Default: `50`.
+- **`--world-space-max-speed-other-mps`**: max speed for non-boat category tracks (m/s). Default: `50`.
+- **`--world-space-max-accel-boat-mps2`**: max acceleration for `boat` category tracks (m/s²). Only effective with the CA model. Default: `20`.
+- **`--world-space-max-accel-other-mps2`**: max acceleration for non-boat category tracks (m/s²). Only effective with the CA model. Default: `20`.
 
 ## File guide (what each file does)
 
