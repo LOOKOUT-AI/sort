@@ -118,8 +118,11 @@ We track in a local tangent plane (ENU = East/North in meters) instead of direct
     - `enu_from_ref` (meters relative to a fixed local reference point)
 - **Bridge populates ENU fields used by the world tracker**: `sort_ws/bridge.py` in `_track_world_space()`:
   - writes `world_east_m` / `world_north_m` into each detection dict
-- **World tracker consumes ENU meters**: `sort_ws/world_space_tracker.py`:
+  - after association, enriches every output track with `enu_ref_lat` / `enu_ref_lon` and full KF kinematic state (`vel_east_mps`, `vel_north_mps`, `speed_mps`, `course_deg`, `accel_east_mps2`, `accel_north_mps2`)
+- **World tracker consumes ENU meters and outputs full kinematic state**: `sort_ws/world_space_tracker.py`:
   - `WorldSpaceSort` reads `world_east_m` / `world_north_m` and associates tracks using meter distances
+  - `assign()` returns a 3-tuple: `(assigned_ids, unmatched_tracks, matched_track_states)` where `matched_track_states` maps each matched track ID to its full KF state (position, velocity, acceleration, speed, course)
+  - Each KF tracker (`KalmanCVPointTracker`, `KalmanCAPointTracker`) exposes `get_full_state()` returning the complete kinematic state as a dict
 
 ```bash
 venv/bin/python sort-3d.py \
@@ -139,6 +142,8 @@ venv/bin/python sort-3d.py \
 - each bbox has `track_id` (stable tracker ID) and, for matched bboxes, `obj_id` (original upstream detection ID)
 - world fields are added (e.g. `world_latitude/world_longitude`, `world_east_m/world_north_m`, etc.); unmatched tracks get back-projected bbox fields for AR view
 - outgoing metadata includes `tracked_space="world_space"` and `tracked_status` (`"matched"` or `"unmatched"`)
+- every track includes the **ENU reference point** (`enu_ref_lat`, `enu_ref_lon`) — the fixed lat/lon origin of the ENU plane (first ego GPS fix), enabling downstream consumers to convert ENU positions/velocities without a separate handshake
+- every track includes **full Kalman Filter kinematic state**: velocity (`vel_east_mps`, `vel_north_mps`), derived speed and course (`speed_mps`, `course_deg`), and acceleration (`accel_east_mps2`, `accel_north_mps2`). Acceleration is `null` for the CV (constant-velocity) model and populated for the CA (constant-acceleration) model
 
 ### Tracker output structure
 
@@ -198,13 +203,13 @@ The tracker uses two counters to decide whether to output a track:
 | **Unmatched (ghost)** | No detection this frame, but `hits >= min_hits` | Confirmed track with no detection; outputs using Kalman prediction |
 | **Warming** | `hits < min_hits` | New track building confidence; not yet output |
 
-**Position source by state:**
+**Position and kinematic source by state:**
 
-| Track State | Position Source |
-|-------------|-----------------|
-| Matched | Detection position |
-| Re-warming | Detection position (not Kalman prediction) |
-| Unmatched (ghost) | Kalman filter prediction |
+| Track State | Position Source | Velocity / Acceleration Source |
+|-------------|-----------------|-------------------------------|
+| Matched | Detection position | KF state (post-update) |
+| Re-warming | Detection position (not Kalman prediction) | KF state (post-update) |
+| Unmatched (ghost) | Kalman filter prediction | KF state (post-predict) |
 
 **Why re-warming uses detection position:**
 
@@ -287,7 +292,7 @@ Uses Kalman-predicted bbox and last known metadata:
 
 ##### 3. World-space tracker, matched
 
-All original detection fields plus computed world fields:
+All original detection fields plus computed world fields and KF kinematic state:
 
 | Field | Source |
 |-------|--------|
@@ -297,6 +302,11 @@ All original detection fields plus computed world fields:
 | `world_latitude`, `world_longitude` | Computed from ego + bearing + distance |
 | `world_east_m`, `world_north_m` | ENU meters from local reference |
 | `world_rel_ego_east_m`, `world_rel_ego_north_m` | ENU meters relative to current ego |
+| `enu_ref_lat`, `enu_ref_lon` | Fixed ENU origin (first ego GPS fix, degrees) |
+| `vel_east_mps`, `vel_north_mps` | KF velocity in ENU (m/s) |
+| `speed_mps` | Derived speed: `hypot(vel_east, vel_north)` (m/s) |
+| `course_deg` | Course over ground: `atan2(vel_east, vel_north)` (0=N, 90=E, degrees) |
+| `accel_east_mps2`, `accel_north_mps2` | KF acceleration in ENU (m/s²); `null` for CV model |
 | `track_id` | Stable tracker ID (1-based) |
 | `tracked_space` | `"world_space"` |
 | `tracked_status` | `"matched"` |
@@ -307,7 +317,7 @@ Tracks with `tracked_status="unmatched"` include two sub-cases with different po
 
 **4a. Ghost tracks (no detection this frame)**
 
-Uses Kalman-predicted world position + stored bbox geometry:
+Uses Kalman-predicted world position + stored bbox geometry + full KF kinematic state:
 
 | Field | Source |
 |-------|--------|
@@ -317,6 +327,11 @@ Uses Kalman-predicted world position + stored bbox geometry:
 | `distance` | Back-projected from predicted world position |
 | `world_latitude`, `world_longitude` | Converted from predicted ENU |
 | `world_rel_ego_east_m`, `world_rel_ego_north_m` | Recomputed relative to current ego |
+| `enu_ref_lat`, `enu_ref_lon` | Fixed ENU origin (first ego GPS fix, degrees) |
+| `vel_east_mps`, `vel_north_mps` | KF velocity in ENU (m/s) |
+| `speed_mps` | Derived speed (m/s) |
+| `course_deg` | Course over ground (degrees) |
+| `accel_east_mps2`, `accel_north_mps2` | KF acceleration in ENU (m/s²); `null` for CV model |
 | `confidence`, `heading`, `category` | Last known values |
 | `track_id` | Stable tracker ID (1-based) |
 | `tracked_space` | `"world_space"` |
@@ -324,7 +339,7 @@ Uses Kalman-predicted world position + stored bbox geometry:
 
 **4b. Re-warming tracks (detection matched, but hit_streak < min_hits)**
 
-**Passes through the full detection directly** — no back-projection needed since we have the actual detection:
+**Passes through the full detection directly** (no back-projection needed) plus KF kinematic state:
 
 | Field | Source |
 |-------|--------|
@@ -335,6 +350,11 @@ Uses Kalman-predicted world position + stored bbox geometry:
 | `world_east_m`, `world_north_m` | From current detection |
 | `world_latitude`, `world_longitude` | From current detection |
 | `world_rel_ego_east_m`, `world_rel_ego_north_m` | From current detection |
+| `enu_ref_lat`, `enu_ref_lon` | Fixed ENU origin (first ego GPS fix, degrees) |
+| `vel_east_mps`, `vel_north_mps` | KF velocity in ENU (m/s) |
+| `speed_mps` | Derived speed (m/s) |
+| `course_deg` | Course over ground (degrees) |
+| `accel_east_mps2`, `accel_north_mps2` | KF acceleration in ENU (m/s²); `null` for CV model |
 | `track_id` | Stable tracker ID (1-based) |
 | `tracked_space` | `"world_space"` |
 | `tracked_status` | `"unmatched"` |
@@ -388,7 +408,7 @@ This allows the AR view to continue showing a bbox overlay for the track even wh
 - **`sort_ws/image_space_tracker.py`**: image-space SORT-style tracker (`ImageSpaceSort`) + IOU association + Hungarian assignment (with optional extra cost terms).
 - **`sort_ws/image_to_world.py`**: math utilities to project pixels + distance into ENU meters and back to lat/lon.
 - **`sort_ws/ego.py`**: ego state smoothing and storage; consumes NMEA JSON, maintains a smoothed `EgoState` (lat/lon/heading and local ENU).
-- **`sort_ws/world_space_tracker.py`**: world-space SORT-style tracker (`WorldSpaceSort`) that tracks points in ENU meters.
+- **`sort_ws/world_space_tracker.py`**: world-space SORT-style tracker (`WorldSpaceSort`) that tracks points in ENU meters. Supports constant-velocity (CV) and constant-acceleration (CA) Kalman Filter models. Each tracker exposes `get_full_state()` returning ENU position, velocity, acceleration, speed, and course.
 
 ## Legacy / unused: MOTChallenge demo (not used by the bridge)
 
