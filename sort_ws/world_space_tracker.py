@@ -11,6 +11,24 @@ from .image_space_tracker import linear_assignment  # reuse lap/scipy wrapper
 from .image_to_world import heading_diff_deg
 
 
+def _clamp_vector(vx: float, vy: float, vmax: float) -> Tuple[float, float]:
+    """Clamp 2D vector magnitude to *vmax*, preserving direction.
+
+    *vmax* < 0 disables the clamp (pass-through).
+    *vmax* == 0 zeroes the vector.
+    *vmax* > 0 caps magnitude while keeping direction.
+    """
+    if vmax < 0.0:
+        return vx, vy
+    if vmax == 0.0:
+        return 0.0, 0.0
+    mag = math.hypot(vx, vy)
+    if mag <= vmax or mag < 1e-12:
+        return vx, vy
+    s = vmax / mag
+    return vx * s, vy * s
+
+
 @dataclass
 class WorldTrackExtras:
     confidence: float = float("nan")
@@ -32,7 +50,16 @@ class KalmanCVPointTracker:
 
     count = 0
 
-    def __init__(self, meas_enu: np.ndarray, extras: WorldTrackExtras):
+    def __init__(
+        self,
+        meas_enu: np.ndarray,
+        extras: WorldTrackExtras,
+        *,
+        max_speed_boat_mps: float = -1.0,
+        max_speed_other_mps: float = -1.0,
+        max_accel_boat_mps2: float = -1.0,   # accepted but unused (CV has no accel state)
+        max_accel_other_mps2: float = -1.0,  # accepted but unused
+    ):
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
         dt = 1.0
         self.kf.F = np.array([[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
@@ -59,6 +86,29 @@ class KalmanCVPointTracker:
         self.age = 0
         self.extras = extras
 
+        # Per-category speed caps (negative = disabled, 0 = clamp to zero)
+        self.max_speed_boat_mps = float(max_speed_boat_mps)
+        self.max_speed_other_mps = float(max_speed_other_mps)
+
+    # ------------------------------------------------------------------
+    # State clamping (applied after predict only)
+    # ------------------------------------------------------------------
+
+    def _resolve_max_speed(self) -> float:
+        """Return the active speed cap based on the track's current category."""
+        cat = (self.extras.category or "").lower()
+        return self.max_speed_boat_mps if cat == "boat" else self.max_speed_other_mps
+
+    def _clamp_state(self) -> None:
+        """Clamp velocity to the category-specific max speed, preserving direction."""
+        max_speed = self._resolve_max_speed()
+        if max_speed >= 0.0:
+            x = self.kf.x
+            ve, vn = float(x[2, 0]), float(x[3, 0])
+            ve_c, vn_c = _clamp_vector(ve, vn, max_speed)
+            x[2, 0] = ve_c
+            x[3, 0] = vn_c
+
     def update(self, meas_enu: np.ndarray, extras: WorldTrackExtras) -> None:
         self.time_since_update = 0
         self.hits += 1
@@ -69,6 +119,7 @@ class KalmanCVPointTracker:
 
     def predict(self) -> np.ndarray:
         self.kf.predict()
+        self._clamp_state()
         self.age += 1
         if self.time_since_update > 0:
             self.hit_streak = 0
@@ -107,7 +158,16 @@ class KalmanCAPointTracker:
 
     count = 0
 
-    def __init__(self, meas_enu: np.ndarray, extras: WorldTrackExtras):
+    def __init__(
+        self,
+        meas_enu: np.ndarray,
+        extras: WorldTrackExtras,
+        *,
+        max_speed_boat_mps: float = -1.0,
+        max_speed_other_mps: float = -1.0,
+        max_accel_boat_mps2: float = -1.0,
+        max_accel_other_mps2: float = -1.0,
+    ):
         self.kf = KalmanFilter(dim_x=6, dim_z=2)
         dt = 1.0
         # fmt: off
@@ -166,6 +226,38 @@ class KalmanCAPointTracker:
         self.age = 0
         self.extras = extras
 
+        # Per-category speed / acceleration caps (negative = disabled, 0 = clamp to zero)
+        self.max_speed_boat_mps = float(max_speed_boat_mps)
+        self.max_speed_other_mps = float(max_speed_other_mps)
+        self.max_accel_boat_mps2 = float(max_accel_boat_mps2)
+        self.max_accel_other_mps2 = float(max_accel_other_mps2)
+
+    # ------------------------------------------------------------------
+    # State clamping (applied after predict only)
+    # ------------------------------------------------------------------
+
+    def _resolve_limits(self) -> Tuple[float, float]:
+        """Return (max_speed, max_accel) based on the track's current category."""
+        cat = (self.extras.category or "").lower()
+        if cat == "boat":
+            return self.max_speed_boat_mps, self.max_accel_boat_mps2
+        return self.max_speed_other_mps, self.max_accel_other_mps2
+
+    def _clamp_state(self) -> None:
+        """Clamp velocity and acceleration to category-specific maxima, preserving direction."""
+        max_speed, max_accel = self._resolve_limits()
+        x = self.kf.x
+        if max_speed >= 0.0:
+            ve, vn = float(x[2, 0]), float(x[3, 0])
+            ve_c, vn_c = _clamp_vector(ve, vn, max_speed)
+            x[2, 0] = ve_c
+            x[3, 0] = vn_c
+        if max_accel >= 0.0:
+            ae, an = float(x[4, 0]), float(x[5, 0])
+            ae_c, an_c = _clamp_vector(ae, an, max_accel)
+            x[4, 0] = ae_c
+            x[5, 0] = an_c
+
     def update(self, meas_enu: np.ndarray, extras: WorldTrackExtras) -> None:
         self.time_since_update = 0
         self.hits += 1
@@ -176,6 +268,7 @@ class KalmanCAPointTracker:
 
     def predict(self) -> np.ndarray:
         self.kf.predict()
+        self._clamp_state()
         self.age += 1
         if self.time_since_update > 0:
             self.hit_streak = 0
@@ -321,6 +414,11 @@ class WorldSpaceSort:
         world_space_gamma_confidence: float = 0.0,
         world_space_new_track_min_confidence: float = 0.0,
         world_space_kf_model: str = "cv",
+        # Per-category kinematic caps (negative = disabled / unclamped, 0 = clamp to zero).
+        world_space_max_speed_boat_mps: float = -1.0,
+        world_space_max_speed_other_mps: float = -1.0,
+        world_space_max_accel_boat_mps2: float = -1.0,
+        world_space_max_accel_other_mps2: float = -1.0,
     ):
         # Keep attribute names short/stable for runtime introspection/logging.
         self.max_age = int(world_space_max_age)
@@ -335,6 +433,14 @@ class WorldSpaceSort:
             raise ValueError(f"Unknown KF model '{world_space_kf_model}', expected 'cv' or 'ca'")
         self.kf_model = kf_model
         self._tracker_class = KalmanCAPointTracker if kf_model == "ca" else KalmanCVPointTracker
+
+        # Kinematic caps forwarded to each tracker instance.
+        self._tracker_kwargs: Dict[str, float] = {
+            "max_speed_boat_mps": float(world_space_max_speed_boat_mps),
+            "max_speed_other_mps": float(world_space_max_speed_other_mps),
+            "max_accel_boat_mps2": float(world_space_max_accel_boat_mps2),
+            "max_accel_other_mps2": float(world_space_max_accel_other_mps2),
+        }
 
         self.trackers: list = []
         self.frame_count = 0
@@ -508,7 +614,7 @@ class WorldSpaceSort:
             conf = float(det_extras[int(det_idx)].confidence)
             if not np.isnan(conf) and conf < self.new_track_min_confidence:
                 continue
-            trk = self._tracker_class(det_xy[int(det_idx), :], det_extras[int(det_idx)])
+            trk = self._tracker_class(det_xy[int(det_idx), :], det_extras[int(det_idx)], **self._tracker_kwargs)
             self.trackers.append(trk)
             track_id = int(trk.id) + 1
             if trk.hit_streak >= self.min_hits:

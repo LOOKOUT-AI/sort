@@ -397,6 +397,17 @@ This allows the AR view to continue showing a bbox overlay for the track even wh
 - **`--world-space-gamma-confidence`**: weight for confidence penalty term
 - **`--world-space-new-track-min-confidence`**: minimum confidence to spawn a new track
 
+#### Per-category kinematic caps
+
+These cap the KF state to physically reasonable values, preventing tracks from "flying away" during occlusions or noisy detections. Clamping is applied after every KF predict step (not after update), preserving direction while capping magnitude.
+
+Sentinel convention: **negative** = disabled (no clamping), **0** = clamp to zero (e.g., force stationary), **positive** = cap at that value. Default: `-1` (disabled).
+
+- **`--world-space-max-speed-boat-mps`**: max speed for `boat` category tracks (m/s). Velocity vector magnitude is clamped to this value. Default: `-1` (disabled).
+- **`--world-space-max-speed-other-mps`**: max speed for non-boat category tracks (m/s). Default: `-1` (disabled).
+- **`--world-space-max-accel-boat-mps2`**: max acceleration for `boat` category tracks (m/s²). Only effective with the CA model. Default: `-1` (disabled).
+- **`--world-space-max-accel-other-mps2`**: max acceleration for non-boat category tracks (m/s²). Only effective with the CA model. Default: `-1` (disabled).
+
 ## File guide (what each file does)
 
 ### Websocket bridge + pipeline
