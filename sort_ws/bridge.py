@@ -466,6 +466,7 @@ async def _downstream_control_handler(
     outbound_to_upstream: "asyncio.Queue[str]",
     mode_state: TrackingModeState,
     playback_cache: PlaybackInfoCache,
+    world_tracker: Optional[WorldSpaceSort] = None,
 ) -> None:
     await control_hub.register(ws)
     try:
@@ -483,9 +484,16 @@ async def _downstream_control_handler(
         except Exception:
             pass
 
+        # Send current tracker params to newly connected clients.
+        try:
+            if world_tracker is not None:
+                await ws.send(json.dumps({"tracker_params": world_tracker.get_tunable_params()}))
+        except Exception:
+            pass
+
         async for msg in ws:
             # Forward downstream control commands upstream (pause/play/seek),
-            # but intercept local tracking-mode changes.
+            # but intercept local tracking-mode and tracker-param changes.
             if isinstance(msg, (bytes, bytearray)):
                 try:
                     msg = msg.decode("utf-8")
@@ -522,6 +530,24 @@ async def _downstream_control_handler(
                     await outbound_to_upstream.put(msg_s)
                     continue
 
+                # --- Tracker param commands (intercepted, NOT forwarded upstream) ---
+                if cmd == "get_tracker_params":
+                    if world_tracker is not None:
+                        try:
+                            await ws.send(json.dumps({"tracker_params": world_tracker.get_tunable_params()}))
+                        except Exception:
+                            pass
+                    continue
+                if cmd == "set_tracker_params":
+                    if world_tracker is not None:
+                        new_params = {k: v for k, v in obj.items() if k not in ("command", "cmd")}
+                        updated = world_tracker.set_tunable_params(new_params)
+                        try:
+                            await ws.send(json.dumps({"ack": "set_tracker_params", "tracker_params": updated}))
+                        except Exception:
+                            pass
+                    continue
+
             await outbound_to_upstream.put(msg_s)
     finally:
         await control_hub.unregister(ws)
@@ -554,7 +580,7 @@ async def run_bridge(
         max_size=None,
     )
     control_server = await websockets.serve(
-        lambda ws: _downstream_control_handler(ws, control_hub, outbound_to_upstream, mode_state, playback_cache),
+        lambda ws: _downstream_control_handler(ws, control_hub, outbound_to_upstream, mode_state, playback_cache, world_tracker),
         cfg.downstream_bind,
         cfg.downstream_control_port,
         max_size=None,

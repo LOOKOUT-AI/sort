@@ -659,3 +659,61 @@ class WorldSpaceSort:
 
         return assigned, unmatched_tracks, matched_track_states
 
+    # ------------------------------------------------------------------
+    # Runtime-tunable parameter API (for live UI adjustment via control WS)
+    # ------------------------------------------------------------------
+
+    # The keys that can be changed at runtime, mapped to their types.
+    _TUNABLE_KEYS: Dict[str, type] = {
+        "max_age": int,
+        "min_hits": int,
+        "max_distance_m": float,
+        "max_speed_boat_mps": float,
+        "max_speed_other_mps": float,
+        "max_accel_boat_mps2": float,
+        "max_accel_other_mps2": float,
+    }
+
+    def get_tunable_params(self) -> Dict[str, Any]:
+        """Return the current values of all runtime-tunable parameters."""
+        return {
+            "max_age": self.max_age,
+            "min_hits": self.min_hits,
+            "max_distance_m": self.max_distance_m,
+            "max_speed_boat_mps": self._tracker_kwargs["max_speed_boat_mps"],
+            "max_speed_other_mps": self._tracker_kwargs["max_speed_other_mps"],
+            "max_accel_boat_mps2": self._tracker_kwargs["max_accel_boat_mps2"],
+            "max_accel_other_mps2": self._tracker_kwargs["max_accel_other_mps2"],
+        }
+
+    def set_tunable_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Update one or more tunable params.  Returns the full updated dict.
+
+        *params* is a partial dict — only keys present are changed.
+        Unrecognised keys are silently ignored.
+        """
+        for key, cast in self._TUNABLE_KEYS.items():
+            if key not in params:
+                continue
+            try:
+                val = cast(params[key])
+            except (TypeError, ValueError):
+                continue
+
+            if key == "max_age":
+                self.max_age = val
+            elif key == "min_hits":
+                self.min_hits = val
+            elif key == "max_distance_m":
+                self.max_distance_m = val
+            elif key in self._tracker_kwargs:
+                # Update for future trackers.
+                self._tracker_kwargs[key] = val
+                # Update all existing tracker instances so the new cap
+                # takes effect immediately.
+                for trk in self.trackers:
+                    if hasattr(trk, key):
+                        setattr(trk, key, val)
+
+        return self.get_tunable_params()
+
