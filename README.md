@@ -25,6 +25,82 @@ For each video frame:
   - unmatched tracks age; tracks exceeding `max_age` are removed
 - **4) Confirm tracks**: only output IDs after a track has enough consecutive hits (`min_hits`).
 
+### Kalman Filter internals
+
+The Kalman Filter (KF) is the motion model that powers each track. It maintains a **state vector** and an **uncertainty covariance**, and alternates between two steps: **predict** and **update**. Both steps modify the state vector.
+
+#### Variables and matrices
+
+| Symbol | Name | Shape (CV / CA) | Description |
+|--------|------|------------------|-------------|
+| **x** | State vector | 4×1 / 6×1 | The tracked quantities. CV: `[east, north, vₑ, vₙ]`. CA: `[east, north, vₑ, vₙ, aₑ, aₙ]`. |
+| **P** | State covariance | 4×4 / 6×6 | Uncertainty of the state estimate. Diagonal = variance of each state variable; off-diagonal = cross-correlations (e.g., how position uncertainty relates to velocity uncertainty). |
+| **F** | State transition (process) matrix | 4×4 / 6×6 | Encodes the physics model. For CV: position += velocity × dt. For CA: position += velocity × dt + ½ × accel × dt², velocity += accel × dt. |
+| **Q** | Process noise covariance | 4×4 / 6×6 | Models how much the real world deviates from the idealized physics. Larger Q → the filter trusts predictions less and relies more on measurements. |
+| **z** | Measurement vector | 2×1 | What the detector actually observes: `[east, north]` (position only — no direct velocity or acceleration measurement). |
+| **H** | Observation (measurement) matrix | 2×4 / 2×6 | Maps the full state to the measurement space. `H = [[1,0,0,0,...],[0,1,0,0,...]]` — it "picks out" just the position components from x. |
+| **R** | Measurement noise covariance | 2×2 | Uncertainty of the detector's position measurements. Larger R → the filter trusts measurements less. |
+| **y** | Innovation (residual) | 2×1 | `y = z − H·x⁻`. The difference between what we measured and what we predicted we'd measure. |
+| **S** | Innovation covariance | 2×2 | `S = H·P⁻·Hᵀ + R`. Combined uncertainty of prediction and measurement in measurement space. |
+| **K** | Kalman gain | 4×2 / 6×2 | `K = P⁻·Hᵀ·S⁻¹`. The "correction weight" that maps a 2D position error into corrections for ALL state variables. This is the key matrix. |
+
+#### Step 1: Predict
+
+Extrapolate the state forward in time using the physics model:
+
+```
+x⁻ = F · x       (predicted state)
+P⁻ = F · P · Fᵀ + Q   (predicted covariance)
+```
+
+For our CV model with dt = 1 frame, F looks like:
+
+```
+F = | 1  0  dt  0 |     x⁻ = | east + vₑ·dt  |
+    | 0  1  0  dt |           | north + vₙ·dt |
+    | 0  0  1   0 |           | vₑ             |
+    | 0  0  0   1 |           | vₙ             |
+```
+
+Position moves by velocity × dt. Velocity stays the same (constant-velocity assumption). The CA model adds acceleration terms similarly.
+
+After predict, we apply **kinematic clamping** (`_clamp_state()`) to cap velocity and acceleration magnitudes.
+
+#### Step 2: Update
+
+Correct the prediction using the actual measurement. **This step modifies ALL state variables**, not just the measured ones:
+
+```
+y = z − H · x⁻           (innovation: position error)
+S = H · P⁻ · Hᵀ + R      (innovation covariance)
+K = P⁻ · Hᵀ · S⁻¹        (Kalman gain)
+x⁺ = x⁻ + K · y          (corrected state)
+P⁺ = (I − K · H) · P⁻    (corrected covariance)
+```
+
+**Why the update changes velocity (and acceleration):** The Kalman gain K is a **4×2 matrix** (CV) or **6×2 matrix** (CA). It maps the 2D position innovation `y` into corrections for every dimension of the state vector. Concretely:
+
+```
+K · y = | K₀₀·yₑ + K₀₁·yₙ |   ← east position correction
+        | K₁₀·yₑ + K₁₁·yₙ |   ← north position correction
+        | K₂₀·yₑ + K₂₁·yₙ |   ← east velocity correction   ← !!
+        | K₃₀·yₑ + K₃₁·yₙ |   ← north velocity correction  ← !!
+```
+
+If the predicted position was too far east compared to the measurement, K will not only correct the position but also *reduce the eastward velocity*. This is how the KF **infers velocity from position-only measurements**: it uses the cross-correlations in P to distribute the position error across all state variables.
+
+The magnitude of velocity correction depends on:
+- **P** cross-terms between position and velocity — if the filter is uncertain about velocity, it allows larger corrections
+- **R** — if measurements are trusted (small R), the correction is larger
+- **Q** — if process noise is large, the filter gives more weight to measurements
+
+After update, we apply **kinematic clamping** again to ensure the corrected velocity/acceleration still respects the configured caps.
+
+#### Why clamping is needed after both steps
+
+- **After predict**: prevents velocity from accumulating beyond physical limits during occlusions (no measurements → predict-only → velocity can grow unbounded in CA, or drift in CV).
+- **After update**: the Kalman gain can inject velocity corrections that exceed the cap. For example, if you clamp velocity to 0 after predict, then the update step computes `x⁺ = x⁻ + K·y` and the K matrix re-introduces non-zero velocity from the measurement innovation. Without post-update clamping, the cap would be violated for matched tracks.
+
 ## What this repo is used for (CV detections over websockets)
 
 We are **not** using MOTChallenge evaluation in day-to-day work here.
@@ -399,7 +475,7 @@ This allows the AR view to continue showing a bbox overlay for the track even wh
 
 #### Per-category kinematic caps
 
-These cap the KF state to physically reasonable values, preventing tracks from "flying away" during occlusions or noisy detections. Clamping is applied after every KF predict step (not after update), preserving direction while capping magnitude.
+These cap the KF state to physically reasonable values, preventing tracks from "flying away" during occlusions or noisy detections. Clamping is applied after both the KF predict and update steps, preserving direction while capping magnitude.
 
 The clamp is always active. **0** = clamp to zero (e.g., force stationary), **positive** = cap at that value. Set a large value (e.g. `50` for speed, `20` for acceleration) if you effectively don't want a constraint.
 

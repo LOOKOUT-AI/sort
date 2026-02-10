@@ -89,7 +89,7 @@ class KalmanCVPointTracker:
         self.max_speed_other_mps = float(max_speed_other_mps)
 
     # ------------------------------------------------------------------
-    # State clamping (applied after predict only)
+    # State clamping (applied after both predict and update)
     # ------------------------------------------------------------------
 
     def _resolve_max_speed(self) -> float:
@@ -112,6 +112,7 @@ class KalmanCVPointTracker:
         self.hit_streak += 1
         z = np.array([[float(meas_enu[0])], [float(meas_enu[1])]], dtype=np.float32)
         self.kf.update(z)
+        self._clamp_state()
         self.extras = extras
 
     def predict(self) -> np.ndarray:
@@ -230,7 +231,7 @@ class KalmanCAPointTracker:
         self.max_accel_other_mps2 = float(max_accel_other_mps2)
 
     # ------------------------------------------------------------------
-    # State clamping (applied after predict only)
+    # State clamping (applied after both predict and update)
     # ------------------------------------------------------------------
 
     def _resolve_limits(self) -> Tuple[float, float]:
@@ -259,6 +260,7 @@ class KalmanCAPointTracker:
         self.hit_streak += 1
         z = np.array([[float(meas_enu[0])], [float(meas_enu[1])]], dtype=np.float32)
         self.kf.update(z)
+        self._clamp_state()
         self.extras = extras
 
     def predict(self) -> np.ndarray:
