@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from filterpy.kalman import KalmanFilter
+
+# Default dt (seconds) used on the very first assign() call when no previous
+# timestamp exists.  The exact value doesn't matter much because there are
+# typically no existing trackers to predict on the first frame.
+_DEFAULT_DT_S: float = 1.0 / 30.0
+
+# Maximum dt (seconds) allowed between consecutive assign() calls.  Caps the
+# time step to prevent numerical instability and unrealistic covariance growth
+# when there's a long pause (e.g., replay paused, reconnect, seek).
+_MAX_DT_S: float = 2.0
 
 
 def linear_assignment(cost_matrix: np.ndarray) -> np.ndarray:
@@ -214,11 +225,13 @@ class KalmanBoxTracker:
 
     def __init__(self, bbox_xyxy: np.ndarray, extras: TrackExtras):
         self.kf = KalmanFilter(dim_x=7, dim_z=4)
+        # F is rebuilt every predict() with real dt; initialise with nominal dt
+        # so filterpy internals have the correct shape.
         self.kf.F = np.array(
             [
-                [1, 0, 0, 0, 1, 0, 0],
-                [0, 1, 0, 0, 0, 1, 0],
-                [0, 0, 1, 0, 0, 0, 1],
+                [1, 0, 0, 0, _DEFAULT_DT_S, 0, 0],
+                [0, 1, 0, 0, 0, _DEFAULT_DT_S, 0],
+                [0, 0, 1, 0, 0, 0, _DEFAULT_DT_S],
                 [0, 0, 0, 1, 0, 0, 0],
                 [0, 0, 0, 0, 1, 0, 0],
                 [0, 0, 0, 0, 0, 1, 0],
@@ -239,6 +252,13 @@ class KalmanBoxTracker:
         self.kf.P *= 10.0
         self.kf.Q[-1, -1] *= 0.01
         self.kf.Q[4:, 4:] *= 0.01
+
+        # Store the base Q (hand-tuned for original SORT).  Unlike the
+        # world-space tracker's physics-based CWNA Q, this Q is an empirical
+        # diagonal and is applied as-is each predict step (not scaled by dt).
+        # The F matrix already uses real dt for velocity terms, which is
+        # sufficient for correct pixel-space prediction.
+        self._Q_base = self.kf.Q.copy()
 
         self.kf.x[:4] = convert_bbox_to_z(bbox_xyxy)
         self.time_since_update = 0
@@ -261,7 +281,20 @@ class KalmanBoxTracker:
         self.kf.update(convert_bbox_to_z(bbox_xyxy))
         self.extras = extras
 
-    def predict(self) -> np.ndarray:
+    def predict(self, dt: float = _DEFAULT_DT_S) -> np.ndarray:
+        """Predict one step forward by *dt* seconds.
+
+        Rebuilds F with the real dt (velocity terms).  Q stays at its
+        original hand-tuned value per step (not scaled by dt) because it's
+        an empirical tuning in pixel space, not a physics-derived model.
+        """
+        # Rebuild velocity terms in F: x += dx*dt, y += dy*dt, s += ds*dt
+        self.kf.F[0, 4] = dt
+        self.kf.F[1, 5] = dt
+        self.kf.F[2, 6] = dt
+        # Q stays at _Q_base (no dt scaling — empirical pixel-space tuning)
+        self.kf.Q = self._Q_base
+
         if (self.kf.x[6] + self.kf.x[2]) <= 0:
             self.kf.x[6] *= 0.0
         self.kf.predict()
@@ -312,6 +345,7 @@ class ImageSpaceSort:
 
         self.trackers: List[KalmanBoxTracker] = []
         self.frame_count = 0
+        self._last_assign_time: Optional[float] = None
 
     def _det_to_xyxy(self, det: Dict[str, Any]) -> Tuple[np.ndarray, TrackExtras]:
         x = float(det.get("x", 0.0))
@@ -345,12 +379,20 @@ class ImageSpaceSort:
         """
         self.frame_count += 1
 
+        # Compute real dt (seconds) from wall-clock time.
+        now = time.monotonic()
+        if self._last_assign_time is not None:
+            dt = max(1e-6, min(now - self._last_assign_time, _MAX_DT_S))
+        else:
+            dt = _DEFAULT_DT_S
+        self._last_assign_time = now
+
         if len(detections) == 0:
             # Still age/predict existing trackers.
             unmatched_tracks: List[Dict[str, Any]] = []
             to_del = []
             for t in range(len(self.trackers)):
-                pos = self.trackers[t].predict()[0]
+                pos = self.trackers[t].predict(dt)[0]
                 if np.any(np.isnan(pos)):
                     to_del.append(t)
                 else:
@@ -399,7 +441,7 @@ class ImageSpaceSort:
         trk_conf = np.full((len(self.trackers),), np.nan, dtype=np.float32)
         to_del: List[int] = []
         for t in range(len(self.trackers)):
-            pos = self.trackers[t].predict()[0]
+            pos = self.trackers[t].predict(dt)[0]
             trks[t, :] = pos.astype(np.float32)
             if np.any(np.isnan(pos)):
                 to_del.append(t)

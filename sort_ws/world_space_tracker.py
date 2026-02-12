@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -9,6 +10,16 @@ from filterpy.kalman import KalmanFilter
 
 from .image_space_tracker import linear_assignment  # reuse lap/scipy wrapper
 from .image_to_world import heading_diff_deg
+
+# Default dt (seconds) used on the very first assign() call when no previous
+# timestamp exists.  The exact value doesn't matter much because there are
+# typically no existing trackers to predict on the first frame.
+_DEFAULT_DT_S: float = 1.0 / 30.0
+
+# Maximum dt (seconds) allowed between consecutive assign() calls.  Caps the
+# time step to prevent numerical instability and unrealistic covariance growth
+# when there's a long pause (e.g., replay paused, reconnect, seek).
+_MAX_DT_S: float = 2.0
 
 
 def _clamp_vector(vx: float, vy: float, vmax: float) -> Tuple[float, float]:
@@ -59,20 +70,23 @@ class KalmanCVPointTracker:
         max_accel_other_mps2: float = 20.0,  # accepted but unused
     ):
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
-        dt = 1.0
-        self.kf.F = np.array([[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
         self.kf.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
+
+        # Process noise intensity (continuous white-noise acceleration spectral
+        # density).  F and Q are rebuilt every predict() call with the real dt.
+        # Scaled up from the original 1.0 to compensate for dt now being in
+        # seconds (~0.03–0.05) rather than the old hardcoded dt=1.  Q_vv scales
+        # as q * dt², so q ≈ 1/dt² ≈ 400 restores comparable per-step noise.
+        self._q_intensity: float = 400.0
+
+        # Initialise F and Q with a nominal dt so filterpy internals have the
+        # correct shape/dtype.  They will be overwritten on the first predict().
+        self._rebuild_dynamics(_DEFAULT_DT_S)
 
         # covariances: tuned for stability (similar spirit to SORT)
         self.kf.R = np.eye(2, dtype=np.float32) * 4.0
         self.kf.P = np.eye(4, dtype=np.float32) * 10.0
         self.kf.P[2:, 2:] *= 1000.0  # velocities initially very uncertain
-
-        q = 1.0
-        self.kf.Q = np.array(
-            [[dt**4 / 4, 0, dt**3 / 2, 0], [0, dt**4 / 4, 0, dt**3 / 2], [dt**3 / 2, 0, dt**2, 0], [0, dt**3 / 2, 0, dt**2]],
-            dtype=np.float32,
-        ) * q
 
         self.kf.x = np.array([[float(meas_enu[0])], [float(meas_enu[1])], [0.0], [0.0]], dtype=np.float32)
 
@@ -106,6 +120,37 @@ class KalmanCVPointTracker:
         x[2, 0] = ve_c
         x[3, 0] = vn_c
 
+    # ------------------------------------------------------------------
+    # Dynamics rebuilding (called every predict with real dt in seconds)
+    # ------------------------------------------------------------------
+
+    def _rebuild_dynamics(self, dt: float) -> None:
+        """Rebuild F and Q matrices for the given time step *dt* (seconds).
+
+        CV state transition:
+            east'  = east + ve * dt
+            north' = north + vn * dt
+            ve'    = ve
+            vn'    = vn
+
+        Q is the standard continuous white-noise acceleration (CWNA) model.
+        """
+        self.kf.F = np.array(
+            [[1, 0, dt, 0],
+             [0, 1, 0, dt],
+             [0, 0, 1, 0],
+             [0, 0, 0, 1]],
+            dtype=np.float32,
+        )
+        q = self._q_intensity
+        self.kf.Q = np.array(
+            [[dt**4 / 4, 0, dt**3 / 2, 0],
+             [0, dt**4 / 4, 0, dt**3 / 2],
+             [dt**3 / 2, 0, dt**2, 0],
+             [0, dt**3 / 2, 0, dt**2]],
+            dtype=np.float32,
+        ) * q
+
     def update(self, meas_enu: np.ndarray, extras: WorldTrackExtras) -> None:
         self.time_since_update = 0
         self.hits += 1
@@ -115,7 +160,9 @@ class KalmanCVPointTracker:
         self._clamp_state()
         self.extras = extras
 
-    def predict(self) -> np.ndarray:
+    def predict(self, dt: float = _DEFAULT_DT_S) -> np.ndarray:
+        """Predict one step forward by *dt* seconds."""
+        self._rebuild_dynamics(dt)
         self.kf.predict()
         self._clamp_state()
         self.age += 1
@@ -167,23 +214,19 @@ class KalmanCAPointTracker:
         max_accel_other_mps2: float = 20.0,
     ):
         self.kf = KalmanFilter(dim_x=6, dim_z=2)
-        dt = 1.0
-        # fmt: off
-        self.kf.F = np.array(
-            [[1, 0, dt, 0,  dt**2/2, 0      ],
-             [0, 1, 0,  dt, 0,       dt**2/2],
-             [0, 0, 1,  0,  dt,      0      ],
-             [0, 0, 0,  1,  0,       dt     ],
-             [0, 0, 0,  0,  1,       0      ],
-             [0, 0, 0,  0,  0,       1      ]],
-            dtype=np.float32,
-        )
         self.kf.H = np.array(
             [[1, 0, 0, 0, 0, 0],
              [0, 1, 0, 0, 0, 0]],
             dtype=np.float32,
         )
-        # fmt: on
+
+        # Process noise intensity (continuous white-noise jerk spectral density).
+        # F and Q are rebuilt every predict() call with the real dt.
+        self._q_jerk: float = 1.0
+
+        # Initialise F and Q with a nominal dt so filterpy internals have the
+        # correct shape/dtype.  They will be overwritten on the first predict().
+        self._rebuild_dynamics(_DEFAULT_DT_S)
 
         # Measurement noise: same sensor as CV, same R.
         self.kf.R = np.eye(2, dtype=np.float32) * 4.0
@@ -192,24 +235,6 @@ class KalmanCAPointTracker:
         self.kf.P = np.eye(6, dtype=np.float32) * 10.0
         self.kf.P[2:4, 2:4] *= 1000.0   # velocities initially very uncertain
         self.kf.P[4:6, 4:6] *= 10000.0   # accelerations even more uncertain
-
-        # Process noise: driven by jerk (white noise) as the unmodeled disturbance.
-        # Per-axis noise gain: G = [dt^3/6, dt^2/2, dt]
-        # Q_axis = q_jerk * G @ G^T, then interleaved for (east, north).
-        q_jerk = 1.0
-        g = np.array([dt**3 / 6.0, dt**2 / 2.0, dt], dtype=np.float32)
-        q_axis = q_jerk * np.outer(g, g)  # 3x3
-        # Assemble 6x6 block-diagonal Q for [e, n, ve, vn, ae, an] ordering
-        # East indices: 0, 2, 4  |  North indices: 1, 3, 5
-        self.kf.Q = np.zeros((6, 6), dtype=np.float32)
-        east_idx = [0, 2, 4]
-        north_idx = [1, 3, 5]
-        for i_s, i_full in enumerate(east_idx):
-            for j_s, j_full in enumerate(east_idx):
-                self.kf.Q[i_full, j_full] = q_axis[i_s, j_s]
-        for i_s, i_full in enumerate(north_idx):
-            for j_s, j_full in enumerate(north_idx):
-                self.kf.Q[i_full, j_full] = q_axis[i_s, j_s]
 
         self.kf.x = np.array(
             [[float(meas_enu[0])], [float(meas_enu[1])], [0.0], [0.0], [0.0], [0.0]],
@@ -254,6 +279,50 @@ class KalmanCAPointTracker:
         x[4, 0] = ae_c
         x[5, 0] = an_c
 
+    # ------------------------------------------------------------------
+    # Dynamics rebuilding (called every predict with real dt in seconds)
+    # ------------------------------------------------------------------
+
+    def _rebuild_dynamics(self, dt: float) -> None:
+        """Rebuild F and Q matrices for the given time step *dt* (seconds).
+
+        CA state transition:
+            east'  = east + ve*dt + 0.5*ae*dt²
+            north' = north + vn*dt + 0.5*an*dt²
+            ve'    = ve + ae*dt
+            vn'    = vn + an*dt
+            ae'    = ae
+            an'    = an
+
+        Q is driven by jerk (white noise) as the unmodeled disturbance.
+        Per-axis noise gain: G = [dt³/6, dt²/2, dt].
+        """
+        # fmt: off
+        self.kf.F = np.array(
+            [[1, 0, dt, 0,  dt**2/2, 0      ],
+             [0, 1, 0,  dt, 0,       dt**2/2],
+             [0, 0, 1,  0,  dt,      0      ],
+             [0, 0, 0,  1,  0,       dt     ],
+             [0, 0, 0,  0,  1,       0      ],
+             [0, 0, 0,  0,  0,       1      ]],
+            dtype=np.float32,
+        )
+        # fmt: on
+        q_jerk = self._q_jerk
+        g = np.array([dt**3 / 6.0, dt**2 / 2.0, dt], dtype=np.float32)
+        q_axis = q_jerk * np.outer(g, g)  # 3×3
+        # Assemble 6×6 block-diagonal Q for [e, n, ve, vn, ae, an] ordering
+        # East indices: 0, 2, 4  |  North indices: 1, 3, 5
+        self.kf.Q = np.zeros((6, 6), dtype=np.float32)
+        east_idx = [0, 2, 4]
+        north_idx = [1, 3, 5]
+        for i_s, i_full in enumerate(east_idx):
+            for j_s, j_full in enumerate(east_idx):
+                self.kf.Q[i_full, j_full] = q_axis[i_s, j_s]
+        for i_s, i_full in enumerate(north_idx):
+            for j_s, j_full in enumerate(north_idx):
+                self.kf.Q[i_full, j_full] = q_axis[i_s, j_s]
+
     def update(self, meas_enu: np.ndarray, extras: WorldTrackExtras) -> None:
         self.time_since_update = 0
         self.hits += 1
@@ -263,7 +332,9 @@ class KalmanCAPointTracker:
         self._clamp_state()
         self.extras = extras
 
-    def predict(self) -> np.ndarray:
+    def predict(self, dt: float = _DEFAULT_DT_S) -> np.ndarray:
+        """Predict one step forward by *dt* seconds."""
+        self._rebuild_dynamics(dt)
         self.kf.predict()
         self._clamp_state()
         self.age += 1
@@ -441,6 +512,7 @@ class WorldSpaceSort:
 
         self.trackers: list = []
         self.frame_count = 0
+        self._last_assign_time: Optional[float] = None
 
     def _det_to_xy(self, det: Dict[str, Any]) -> Tuple[np.ndarray, WorldTrackExtras]:
         e = float(det.get("world_east_m"))
@@ -489,12 +561,20 @@ class WorldSpaceSort:
         """
         self.frame_count += 1
 
+        # Compute real dt (seconds) from wall-clock time.
+        now = time.monotonic()
+        if self._last_assign_time is not None:
+            dt = max(1e-6, min(now - self._last_assign_time, _MAX_DT_S))
+        else:
+            dt = _DEFAULT_DT_S
+        self._last_assign_time = now
+
         if len(detections) == 0:
             # age/predict existing trackers
             unmatched_tracks: List[Dict[str, Any]] = []
             to_del: List[int] = []
             for t in range(len(self.trackers)):
-                pos = self.trackers[t].predict()
+                pos = self.trackers[t].predict(dt)
                 if np.any(np.isnan(pos)):
                     to_del.append(t)
                 else:
@@ -548,7 +628,7 @@ class WorldSpaceSort:
         trk_conf = np.full((len(self.trackers),), np.nan, dtype=np.float32)
         to_del: List[int] = []
         for t in range(len(self.trackers)):
-            pos = self.trackers[t].predict()
+            pos = self.trackers[t].predict(dt)
             trk_xy[t, :] = pos.astype(np.float32)
             if np.any(np.isnan(pos)):
                 to_del.append(t)
