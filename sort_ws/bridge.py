@@ -714,28 +714,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--world-space-max-speed-boat-mps",
         dest="world_space_max_speed_boat_mps",
         type=float,
-        default=50.0,
+        default=20.0,
         help="Max speed cap for 'boat' category tracks (m/s). 0 = clamp velocity to zero. Use a large value (e.g. 1000) to effectively uncap.",
     )
     p.add_argument(
         "--world-space-max-speed-other-mps",
         dest="world_space_max_speed_other_mps",
         type=float,
-        default=50.0,
+        default=0.0,
         help="Max speed cap for non-boat category tracks (m/s). 0 = clamp velocity to zero. Use a large value (e.g. 1000) to effectively uncap.",
     )
     p.add_argument(
         "--world-space-max-accel-boat-mps2",
         dest="world_space_max_accel_boat_mps2",
         type=float,
-        default=20.0,
+        default=10.0,
         help="Max acceleration cap for 'boat' category tracks (m/s²). Only used with CA model. 0 = clamp acceleration to zero. Use a large value (e.g. 100) to effectively uncap.",
     )
     p.add_argument(
         "--world-space-max-accel-other-mps2",
         dest="world_space_max_accel_other_mps2",
         type=float,
-        default=20.0,
+        default=0.0,
         help="Max acceleration cap for non-boat category tracks (m/s²). Only used with CA model. 0 = clamp acceleration to zero. Use a large value (e.g. 100) to effectively uncap.",
     )
 
