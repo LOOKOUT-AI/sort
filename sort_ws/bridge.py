@@ -42,6 +42,10 @@ class BridgeConfig:
     world_space_fov_x_deg: float = 90.0
     world_space_camera_yaw_offset_deg: float = 0.0
 
+    # Simulation ingestion ports (bridge acts as server, frontend connects as client)
+    sim_video_port: int = 0
+    sim_nmea_port: int = 0
+
     # Logging
     # If > 0, print a simple progress line every N upstream video frames.
     log_every_n_frames: int = 0
@@ -306,6 +310,75 @@ async def _track_world_space(
     
     return tracked_bboxes
 
+async def _process_video_payload(
+    payload: bytes,
+    *,
+    cfg: BridgeConfig,
+    mode_state: TrackingModeState,
+    image_tracker: ImageSpaceSort,
+    world_tracker: Optional[WorldSpaceSort],
+    ego_store: Optional[EgoStateStore],
+    video_hub: BroadcastHub,
+    frame_counter: List[int],
+    source_label: str = "upstream",
+) -> None:
+    """Shared tracking pipeline for both upstream replay and simulation ingestion."""
+    frame_counter[0] += 1
+    vm = decode_video_message(payload)
+    bboxes = vm.metadata.get("bboxes", [])
+    if not isinstance(bboxes, list):
+        bboxes = []
+
+    # Always compute image-space tracks.
+    tracked_local = _track_image_space(bboxes, image_tracker)
+
+    # Also compute world-space tracks when possible (may be empty until ego arrives).
+    tracked_world: List[Dict[str, Any]] = []
+    if world_tracker is not None and ego_store is not None:
+        tracked_world = await _track_world_space(
+            bboxes=bboxes,
+            world_tracker=world_tracker,
+            ego_store=ego_store,
+            cfg=cfg,
+        )
+
+    # Choose which list goes into `bboxes`.
+    mode = await mode_state.get()
+    tracked_bboxes = tracked_local
+    selected_space = "image_space"
+    if mode == "world_space":
+        tracked_bboxes = tracked_world
+        selected_space = "world_space"
+    elif mode == "auto":
+        if tracked_world:
+            tracked_bboxes = tracked_world
+            selected_space = "world_space"
+
+    vm.metadata["bboxes"] = tracked_bboxes
+    vm.metadata["tracked"] = True
+    out_payload = encode_video_message(vm.metadata, vm.jpeg_bytes)
+    await video_hub.broadcast(out_payload)
+
+    if cfg.log_every_n_frames and frame_counter[0] % int(cfg.log_every_n_frames) == 0:
+        active = world_tracker if (selected_space == "world_space" and world_tracker is not None) else image_tracker
+        try:
+            active_tracks = len(active.trackers)
+        except Exception:
+            active_tracks = -1
+        try:
+            active_frame_count = int(getattr(active, "frame_count", -1))
+        except Exception:
+            active_frame_count = -1
+        try:
+            active_max_age = int(getattr(active, "max_age", -1))
+        except Exception:
+            active_max_age = -1
+        print(
+            f"[sort-ws] [{source_label}] frames={frame_counter[0]} "
+            f"tracker_frames={active_frame_count} tracks={active_tracks} max_age={active_max_age}"
+        )
+
+
 async def _upstream_video_loop(
     cfg: BridgeConfig,
     mode_state: TrackingModeState,
@@ -315,7 +388,7 @@ async def _upstream_video_loop(
     video_hub: BroadcastHub,
 ) -> None:
     url = _ws_url(cfg.upstream_host, cfg.upstream_video_port)
-    upstream_frame_count = 0
+    frame_counter = [0]
     while True:
         try:
             async with websockets.connect(url, max_size=None) as upstream:
@@ -323,60 +396,17 @@ async def _upstream_video_loop(
                 async for payload in upstream:
                     if not isinstance(payload, (bytes, bytearray)):
                         continue
-                    upstream_frame_count += 1
-                    vm = decode_video_message(payload)
-                    bboxes = vm.metadata.get("bboxes", [])
-                    if not isinstance(bboxes, list):
-                        bboxes = []
-
-                    # Always compute image-space tracks.
-                    tracked_local = _track_image_space(bboxes, image_tracker)
-
-                    # Also compute world-space tracks when possible (may be empty until ego arrives).
-                    tracked_world: List[Dict[str, Any]] = []
-                    if world_tracker is not None and ego_store is not None:
-                        tracked_world = await _track_world_space(
-                            bboxes=bboxes,
-                            world_tracker=world_tracker,
-                            ego_store=ego_store,
-                            cfg=cfg,
-                        )
-
-                    # Choose which list goes into `bboxes`.
-                    mode = await mode_state.get()
-                    tracked_bboxes = tracked_local
-                    selected_space = "image_space"
-                    if mode == "world_space":
-                        tracked_bboxes = tracked_world
-                        selected_space = "world_space"
-                    elif mode == "auto":
-                        if tracked_world:
-                            tracked_bboxes = tracked_world
-                            selected_space = "world_space"
-
-                    vm.metadata["bboxes"] = tracked_bboxes
-                    vm.metadata["tracked"] = True
-                    out_payload = encode_video_message(vm.metadata, vm.jpeg_bytes)
-                    await video_hub.broadcast(out_payload)
-
-                    if cfg.log_every_n_frames and upstream_frame_count % int(cfg.log_every_n_frames) == 0:
-                        active = world_tracker if (selected_space == "world_space" and world_tracker is not None) else image_tracker
-                        try:
-                            active_tracks = len(active.trackers)
-                        except Exception:
-                            active_tracks = -1
-                        try:
-                            active_frame_count = int(getattr(active, "frame_count", -1))
-                        except Exception:
-                            active_frame_count = -1
-                        try:
-                            active_max_age = int(getattr(active, "max_age", -1))
-                        except Exception:
-                            active_max_age = -1
-                        print(
-                            f"[sort-ws] frames upstream={upstream_frame_count} "
-                            f"tracker_frames={active_frame_count} tracks={active_tracks} max_age={active_max_age}"
-                        )
+                    await _process_video_payload(
+                        payload,
+                        cfg=cfg,
+                        mode_state=mode_state,
+                        image_tracker=image_tracker,
+                        world_tracker=world_tracker,
+                        ego_store=ego_store,
+                        video_hub=video_hub,
+                        frame_counter=frame_counter,
+                        source_label="upstream",
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -553,6 +583,61 @@ async def _downstream_control_handler(
         await control_hub.unregister(ws)
 
 
+async def _sim_video_handler(
+    ws: WebSocketServerProtocol,
+    *,
+    cfg: BridgeConfig,
+    mode_state: TrackingModeState,
+    image_tracker: ImageSpaceSort,
+    world_tracker: Optional[WorldSpaceSort],
+    ego_store: Optional[EgoStateStore],
+    video_hub: BroadcastHub,
+) -> None:
+    """Accept video+bbox messages from the frontend simulator."""
+    print("[sort-ws] Simulation video client connected")
+    frame_counter = [0]
+    try:
+        async for payload in ws:
+            if not isinstance(payload, (bytes, bytearray)):
+                continue
+            await _process_video_payload(
+                payload,
+                cfg=cfg,
+                mode_state=mode_state,
+                image_tracker=image_tracker,
+                world_tracker=world_tracker,
+                ego_store=ego_store,
+                video_hub=video_hub,
+                frame_counter=frame_counter,
+                source_label="sim",
+            )
+    except ConnectionClosed:
+        pass
+    finally:
+        print(f"[sort-ws] Simulation video client disconnected (processed {frame_counter[0]} frames)")
+
+
+async def _sim_nmea_handler(
+    ws: WebSocketServerProtocol,
+    *,
+    nmea_hub: BroadcastHub,
+    ego_store: Optional[EgoStateStore],
+) -> None:
+    """Accept NMEA JSON messages from the frontend simulator."""
+    print("[sort-ws] Simulation NMEA client connected")
+    msg_count = 0
+    try:
+        async for msg in ws:
+            if ego_store is not None and isinstance(msg, str):
+                await ego_store.update_from_nmea_json(msg)
+            await nmea_hub.broadcast(msg)
+            msg_count += 1
+    except ConnectionClosed:
+        pass
+    finally:
+        print(f"[sort-ws] Simulation NMEA client disconnected ({msg_count} messages)")
+
+
 async def run_bridge(
     cfg: BridgeConfig,
     image_tracker: ImageSpaceSort,
@@ -586,10 +671,42 @@ async def run_bridge(
         max_size=None,
     )
 
+    # Simulation ingestion servers (frontend connects as client)
+    sim_servers = []
+    if cfg.sim_video_port:
+        sim_video_server = await websockets.serve(
+            lambda ws: _sim_video_handler(
+                ws,
+                cfg=cfg,
+                mode_state=mode_state,
+                image_tracker=image_tracker,
+                world_tracker=world_tracker,
+                ego_store=ego_store,
+                video_hub=video_hub,
+            ),
+            cfg.downstream_bind,
+            cfg.sim_video_port,
+            max_size=None,
+        )
+        sim_servers.append(sim_video_server)
+
+    if cfg.sim_nmea_port:
+        sim_nmea_server = await websockets.serve(
+            lambda ws: _sim_nmea_handler(ws, nmea_hub=nmea_hub, ego_store=ego_store),
+            cfg.downstream_bind,
+            cfg.sim_nmea_port,
+            max_size=None,
+        )
+        sim_servers.append(sim_nmea_server)
+
     print("[sort-ws] Starting downstream websocket servers:")
     print(f"  video   ws://{cfg.downstream_bind}:{cfg.downstream_video_port}")
     print(f"  nmea    ws://{cfg.downstream_bind}:{cfg.downstream_nmea_port}")
     print(f"  control ws://{cfg.downstream_bind}:{cfg.downstream_control_port}")
+    if cfg.sim_video_port:
+        print(f"  sim-video ws://{cfg.downstream_bind}:{cfg.sim_video_port}")
+    if cfg.sim_nmea_port:
+        print(f"  sim-nmea  ws://{cfg.downstream_bind}:{cfg.sim_nmea_port}")
     print("[sort-ws] Connecting to upstream websocket servers:")
     print(f"  video   {_ws_url(cfg.upstream_host, cfg.upstream_video_port)}")
     print(f"  nmea    {_ws_url(cfg.upstream_host, cfg.upstream_nmea_port)}")
@@ -605,9 +722,13 @@ async def run_bridge(
         video_server.close()
         nmea_server.close()
         control_server.close()
+        for s in sim_servers:
+            s.close()
         await video_server.wait_closed()
         await nmea_server.wait_closed()
         await control_server.wait_closed()
+        for s in sim_servers:
+            await s.wait_closed()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -739,6 +860,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Max acceleration cap for non-boat category tracks (m/s²). Only used with CA model. 0 = clamp acceleration to zero. Use a large value (e.g. 100) to effectively uncap.",
     )
 
+    # Simulation ingestion ports (bridge acts as server, frontend connects as client)
+    p.add_argument(
+        "--sim-video-port",
+        dest="sim_video_port",
+        type=int,
+        default=5003,
+        help="Port for simulation video ingestion (0 to disable). Frontend simulator connects here to send video+bbox data.",
+    )
+    p.add_argument(
+        "--sim-nmea-port",
+        dest="sim_nmea_port",
+        type=int,
+        default=3638,
+        help="Port for simulation NMEA ingestion (0 to disable). Frontend simulator connects here to send NMEA data.",
+    )
+
     p.add_argument(
         "--log-every-n-frames",
         type=int,
@@ -766,6 +903,8 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         world_space_cv_width_px=int(args.world_space_cv_width_px),
         world_space_fov_x_deg=float(args.world_space_fov_x_deg),
         world_space_camera_yaw_offset_deg=float(args.world_space_camera_yaw_offset_deg),
+        sim_video_port=int(args.sim_video_port),
+        sim_nmea_port=int(args.sim_nmea_port),
         log_every_n_frames=int(args.log_every_n_frames),
     )
 
