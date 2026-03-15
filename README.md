@@ -101,6 +101,104 @@ After update, we apply **kinematic clamping** again to ensure the corrected velo
 - **After predict**: prevents velocity from accumulating beyond physical limits during occlusions (no measurements → predict-only → velocity can grow unbounded in CA, or drift in CV).
 - **After update**: the Kalman gain can inject velocity corrections that exceed the cap. For example, if you clamp velocity to 0 after predict, then the update step computes `x⁺ = x⁻ + K·y` and the K matrix re-introduces non-zero velocity from the measurement innovation. Without post-update clamping, the cap would be violated for matched tracks.
 
+#### Common KF questions for the world-space tracker
+
+**Q: What is the difference between state covariance and process noise covariance?**
+
+- `self.kf.P` is the **state covariance**: the filter's current uncertainty about the estimated state `x`.
+- `self.kf.Q` is the **process noise covariance**: how much unmodeled motion/disturbance we expect beyond the ideal CV/CA physics model.
+- `self.kf.R` is the **measurement noise covariance**: how noisy we think the detector's measured position is.
+
+In short:
+
+- bigger `P` means "I am less sure about this track right now"
+- bigger `Q` means "the real world may deviate more from my motion model"
+- bigger `R` means "the measurements may be noisier"
+
+**Q: Where in the code do I change process noise covariance or measurement noise covariance?**
+
+In `sort_ws/world_space_tracker.py`:
+
+- **CV model (`KalmanCVPointTracker`)**
+  - process noise intensity: `self._q_intensity`
+  - process covariance matrix build: `_rebuild_dynamics()` where `self.kf.Q` is rebuilt from `dt`
+  - measurement covariance: `self.kf.R = np.eye(2, dtype=np.float32) * 4.0`
+  - initial state covariance: `self.kf.P`
+- **CA model (`KalmanCAPointTracker`)**
+  - process noise intensity: `self._q_jerk`
+  - process covariance matrix build: `_rebuild_dynamics()` where `self.kf.Q` is rebuilt from `dt`
+  - measurement covariance: `self.kf.R = np.eye(2, dtype=np.float32) * 4.0`
+  - initial state covariance: `self.kf.P`
+
+**Q: What does "over time" mean when we say the KF trusts prediction or measurement more?**
+
+The trust split is not fixed. It changes every cycle because it depends on the current covariance:
+
+```text
+P⁻ = F · P · Fᵀ + Q
+K = P⁻ · Hᵀ · (H · P⁻ · Hᵀ + R)⁻¹
+x⁺ = x⁻ + K · (z − H · x⁻)
+```
+
+- the **predict** step propagates uncertainty forward and adds `Q`
+- the **update** step computes `K` from the current predicted covariance `P⁻` and `R`
+- larger `K` means more measurement trust; smaller `K` means more prediction trust
+
+So yes, there is effectively an **initial trust behavior** and a **later trust behavior**:
+
+- early in a track, initial `P` is large (especially for velocity/acceleration), so the filter is more uncertain
+- after repeated updates, `P` often shrinks and `K` settles toward a more stable value
+- if measurements are missed for several frames, `P` grows again during predict-only steps, so `K` may increase when a measurement finally arrives
+
+Because this tracker rebuilds `F` and `Q` from the real `dt` every frame, `K` can vary with timing, missed detections, and maneuvers.
+
+**Q: What is the current input into the world-space tracker?**
+
+The world-space Kalman Filter does **not** directly ingest image-space `x/y/w/h` as its measurement.
+
+Current pipeline:
+
+- upstream detections typically include image-space fields such as `x`, `y`, `width`/`w`, `height`/`h`, `distance`, `heading`, `category`, and `confidence`
+- in `sort_ws/bridge.py`, `_track_world_space()` uses the detection's horizontal position (`x + width/2`) plus `distance`, ego pose, and camera parameters to project the detection into local ENU meters
+- that projection writes `world_east_m` and `world_north_m` into the detection dict
+- `WorldSpaceSort.assign()` then uses `[world_east_m, world_north_m]` as the KF measurement `z`
+
+What each field is used for:
+
+- `world_east_m`, `world_north_m`: direct Kalman measurement input
+- `heading`, `confidence`: used in association cost / metadata, not as KF state measurements
+- `category`: used for speed/acceleration caps
+- `y`, `width`, `height`: mainly preserved for unmatched-track back-projection and output formatting
+
+**Q: If distance is unstable/jumpy, does that affect each track's `P/Q/R/K`?**
+
+Jumpy distance causes jumpy ENU measurements, because `distance` is part of the image-to-world projection. That mainly affects the measurement `z`.
+
+- `Q` and `R` are fixed tuning parameters in the current implementation, so noisy distance does **not** directly change their numeric values
+- noisy distance does make `z` noisier, which can cause larger innovations `y = z - Hx⁻`
+- that can make the corrected state wiggle more if the filter is trusting measurements strongly
+- if the noise is bad enough to cause missed associations, the tracker may do several predict-only steps, which grows `P`
+- once `P` is larger, the next matched update often produces a larger `K`, so the measurement can pull the state harder
+
+So the short version is:
+
+- noisy distance directly corrupts the measurement `z`
+- it does not directly rewrite `Q` or `R`
+- it can indirectly change `P` and therefore `K` over subsequent frames
+
+**Q: If I scale both `Q` and `R` up by the same factor, but keep their ratio the same, does behavior change?**
+
+Usually yes, especially during startup and other non-steady situations.
+
+- in an ideal linear time-invariant system, scaling both `Q` and `R` by the same factor can lead to a similar steady-state gain
+- in this tracker, behavior is not perfectly invariant because initial `P` is fixed, `dt` varies, association/gating is nonlinear, missed updates happen, and kinematic clamping is applied outside the pure KF equations
+
+So if you double, triple, or quadruple both `Q` and `R` while keeping the same ratio:
+
+- steady-state behavior may look somewhat similar
+- transient behavior, convergence speed, recovery after misses, and even association outcomes can still change
+- therefore "same `Q:R` ratio" does **not** guarantee identical tracker behavior in this pipeline
+
 ## What this repo is used for (CV detections over websockets)
 
 We are **not** using MOTChallenge evaluation in day-to-day work here.
@@ -448,6 +546,48 @@ For **ghost tracks only**, we back-project world position to image space:
 For **re-warming tracks**, no back-projection is needed — we pass through the detection data directly.
 
 This allows the AR view to continue showing a bbox overlay for the track even when the detector completely misses the object (ghost tracks).
+
+### Troubleshooting: "Why does world tracker output stick to simulated track?"
+
+**Q:** In `lookout-V2` track sim mode, I set distance noise offset to `30m` and frequency to `2 Hz`. I expected SORT world tracker output to look more smoothed by the Kalman filter, but the displayed world tracker track appears to stick exactly to the simulated track. Why?
+
+**A:** This is usually expected with the current pipeline. The most important reason is that in world-space mode, **matched track position output uses the current detection position**, not the KF-predicted position. The KF still runs and updates velocity/acceleration state, but the emitted matched position follows the measurement.
+
+Possible reasons (full list):
+
+1. **Matched world-space output is detection-position based by design**
+   - In `sort_ws/bridge.py`, `_track_world_space()` builds matched outputs from the detection dict (`det2 = dict(det)`), so position fields (`world_east_m`, `world_north_m`, and related world fields) are from the current detection projection.
+   - KF kinematic fields (velocity/speed/course/accel) are merged, but matched position is not replaced with KF position.
+
+2. **Continuous detections keep tracks in matched state**
+   - In tracker sim, if detections are present every frame (for example `detectionVisibleFrames=1`, `detectionHiddenFrames=0`), tracks remain matched continuously.
+   - You only see true KF-predicted position during ghost/unmatched frames (no matched detection).
+
+3. **Re-warming behavior also prefers detection position**
+   - Re-warming tracks (matched detection, but not enough consecutive hit streak yet) are passed through using detection fields, not back-projected KF ghost position.
+   - This can look like "unmatched" output that still follows detections.
+
+4. **Noise is injected upstream into distance measurement used by both sides**
+   - `lookout-V2` simulation applies noise to bbox `distance` before sending.
+   - The world tracker then projects world position from that noisy measurement, so displayed track can remain tightly coupled to simulated noisy input.
+
+5. **Frontend smoothing may be disabled**
+   - In `lookout-V2/src/aerialCVObjects.js`, default smoothing mode is effectively pass-through (`_smoothBy = 'none'`), so frontend visualization does not add extra positional smoothing.
+
+6. **You may be comparing against ground-truth overlay**
+   - Track sim can also render ground-truth CV objects in aerial view. If both layers are visible, outputs can appear identical or nearly identical.
+
+7. **Tracked-space mode may not be what you think**
+   - If UI mode is `auto`, output selection can switch between image/world spaces depending on availability.
+   - Confirm you are explicitly observing world-space track output.
+
+8. **2 Hz sinusoidal noise is coherent, not random**
+   - A deterministic sinusoid at sim tick rate can look like a stable wobble rather than random jitter. With per-frame matches, measurement-following output still appears "locked" to the signal.
+
+9. **Stable association reduces visible KF-only effects**
+   - In easy single-target cases with stable matching and no dropouts, there is little need to coast on prediction. Visual smoothing from KF position is therefore less obvious.
+
+**Practical implication:** if you want visibly smoothed **position** on matched frames, bridge behavior must be changed to emit KF position for matched world-space tracks (or made configurable), instead of forwarding matched detection position fields.
 
 ### Parameters (what they mean)
 
