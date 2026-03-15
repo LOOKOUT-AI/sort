@@ -242,6 +242,9 @@ async def _track_world_space(
             det2["course_deg"] = kf_state["course_deg"]
             det2["accel_east_mps2"] = kf_state["accel_east_mps2"]
             det2["accel_north_mps2"] = kf_state["accel_north_mps2"]
+            det2["state_position_covariance_enu"] = kf_state["state_position_covariance_enu"]
+            det2["process_position_covariance_enu"] = kf_state["process_position_covariance_enu"]
+            det2["measurement_position_covariance_enu"] = kf_state["measurement_position_covariance_enu"]
         tracked_bboxes.append(det2)
     
     # Process unmatched but confirmed tracks (ghost tracks and re-warming tracks)
@@ -792,8 +795,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     # World-space tracker params (shown in --help)
-    p.add_argument("--world-space-max-age", dest="world_space_max_age", type=int, default=300)
-    p.add_argument("--world-space-min-hits", dest="world_space_min_hits", type=int, default=40)
+    p.add_argument("--world-space-max-age", dest="world_space_max_age", type=int, default=50)
+    p.add_argument("--world-space-min-hits", dest="world_space_min_hits", type=int, default=5)
     p.add_argument(
         "--world-space-max-distance-m",
         dest="world_space_max_distance_m",

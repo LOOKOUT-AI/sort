@@ -22,6 +22,14 @@ _DEFAULT_DT_S: float = 1.0 / 30.0
 _MAX_DT_S: float = 2.0
 
 
+def _matrix2_to_nested_list(mat: np.ndarray) -> List[List[float]]:
+    """Convert a 2x2 numpy array into nested Python float lists for JSON transport."""
+    return [
+        [float(mat[0, 0]), float(mat[0, 1])],
+        [float(mat[1, 0]), float(mat[1, 1])],
+    ]
+
+
 def _clamp_vector(vx: float, vy: float, vmax: float) -> Tuple[float, float]:
     """Clamp 2D vector magnitude to *vmax*, preserving direction.
 
@@ -77,14 +85,16 @@ class KalmanCVPointTracker:
         # Scaled up from the original 1.0 to compensate for dt now being in
         # seconds (~0.03–0.05) rather than the old hardcoded dt=1.  Q_vv scales
         # as q * dt², so q ≈ 1/dt² ≈ 400 restores comparable per-step noise.
-        self._q_intensity: float = 400.0
+        # self._q_intensity: float = 400.0
+        self._q_intensity: float = 10.0
 
         # Initialise F and Q with a nominal dt so filterpy internals have the
         # correct shape/dtype.  They will be overwritten on the first predict().
         self._rebuild_dynamics(_DEFAULT_DT_S)
 
         # covariances: tuned for stability (similar spirit to SORT)
-        self.kf.R = np.eye(2, dtype=np.float32) * 4.0
+        # self.kf.R = np.eye(2, dtype=np.float32) * 4.0
+        self.kf.R = np.eye(2, dtype=np.float32) * 160.0
         self.kf.P = np.eye(4, dtype=np.float32) * 10.0
         self.kf.P[2:, 2:] *= 1000.0  # velocities initially very uncertain
 
@@ -160,6 +170,18 @@ class KalmanCVPointTracker:
         self._clamp_state()
         self.extras = extras
 
+    def update_rewarming(self, meas_enu: np.ndarray, extras: WorldTrackExtras) -> None:
+        """Mark a matched rewarming track as seen without correcting the KF state."""
+        self.time_since_update = 0
+        self.hits += 1
+        self.hit_streak += 1
+
+        z = np.array([[float(meas_enu[0])], [float(meas_enu[1])]], dtype=np.float32)
+        self.kf.update(z)
+        self._clamp_state()
+
+        self.extras = extras
+
     def predict(self, dt: float = _DEFAULT_DT_S) -> np.ndarray:
         """Predict one step forward by *dt* seconds."""
         self._rebuild_dynamics(dt)
@@ -175,8 +197,16 @@ class KalmanCVPointTracker:
         # return [east, north]
         return self.kf.x[:2, 0].astype(np.float32)
 
-    def get_full_state(self) -> Dict[str, float]:
-        """Return full KF state as a dict: position, velocity, and convenience scalars."""
+    def get_position_covariances(self) -> Dict[str, List[List[float]]]:
+        """Return 2x2 ENU position covariance blocks for state, process, and measurement."""
+        return {
+            "state_position_covariance_enu": _matrix2_to_nested_list(self.kf.P[:2, :2]),
+            "process_position_covariance_enu": _matrix2_to_nested_list(self.kf.Q[:2, :2]),
+            "measurement_position_covariance_enu": _matrix2_to_nested_list(self.kf.R[:2, :2]),
+        }
+
+    def get_full_state(self) -> Dict[str, Any]:
+        """Return full KF state as a dict: position, velocity, and covariance summaries."""
         x = self.kf.x.flatten()
         east, north, ve, vn = float(x[0]), float(x[1]), float(x[2]), float(x[3])
         speed = math.hypot(ve, vn)
@@ -190,6 +220,7 @@ class KalmanCVPointTracker:
             "course_deg": course,
             "accel_east_mps2": None,
             "accel_north_mps2": None,
+            **self.get_position_covariances(),
         }
 
 
@@ -332,6 +363,18 @@ class KalmanCAPointTracker:
         self._clamp_state()
         self.extras = extras
 
+    def update_rewarming(self, meas_enu: np.ndarray, extras: WorldTrackExtras) -> None:
+        """Mark a matched rewarming track as seen without correcting the KF state."""
+        self.time_since_update = 0
+        self.hits += 1
+        self.hit_streak += 1
+
+        z = np.array([[float(meas_enu[0])], [float(meas_enu[1])]], dtype=np.float32)
+        self.kf.update(z)
+        self._clamp_state()
+
+        self.extras = extras
+
     def predict(self, dt: float = _DEFAULT_DT_S) -> np.ndarray:
         """Predict one step forward by *dt* seconds."""
         self._rebuild_dynamics(dt)
@@ -347,8 +390,16 @@ class KalmanCAPointTracker:
         # return [east, north]
         return self.kf.x[:2, 0].astype(np.float32)
 
-    def get_full_state(self) -> Dict[str, float]:
-        """Return full KF state as a dict: position, velocity, acceleration, and convenience scalars."""
+    def get_position_covariances(self) -> Dict[str, List[List[float]]]:
+        """Return 2x2 ENU position covariance blocks for state, process, and measurement."""
+        return {
+            "state_position_covariance_enu": _matrix2_to_nested_list(self.kf.P[:2, :2]),
+            "process_position_covariance_enu": _matrix2_to_nested_list(self.kf.Q[:2, :2]),
+            "measurement_position_covariance_enu": _matrix2_to_nested_list(self.kf.R[:2, :2]),
+        }
+
+    def get_full_state(self) -> Dict[str, Any]:
+        """Return full KF state as a dict: position, velocity, acceleration, and covariance summaries."""
         x = self.kf.x.flatten()
         east, north = float(x[0]), float(x[1])
         ve, vn = float(x[2]), float(x[3])
@@ -364,6 +415,7 @@ class KalmanCAPointTracker:
             "course_deg": course,
             "accel_east_mps2": ae,
             "accel_north_mps2": an,
+            **self.get_position_covariances(),
         }
 
 
@@ -600,6 +652,9 @@ class WorldSpaceSort:
                             "course_deg": full_state["course_deg"],
                             "accel_east_mps2": full_state["accel_east_mps2"],
                             "accel_north_mps2": full_state["accel_north_mps2"],
+                            "state_position_covariance_enu": full_state["state_position_covariance_enu"],
+                            "process_position_covariance_enu": full_state["process_position_covariance_enu"],
+                            "measurement_position_covariance_enu": full_state["measurement_position_covariance_enu"],
                         }
                         unmatched_tracks.append(entry)
             for t in reversed(to_del):
@@ -660,20 +715,32 @@ class WorldSpaceSort:
         rewarming_tracks: List[Dict[str, Any]] = []
 
         for det_idx, trk_idx in matches:
-            matched_trk_indices.add(int(trk_idx))
-            self.trackers[int(trk_idx)].update(det_xy[int(det_idx), :], det_extras[int(det_idx)])
-            trk = self.trackers[int(trk_idx)]
+            trk_idx_i = int(trk_idx)
+            det_idx_i = int(det_idx)
+            matched_trk_indices.add(trk_idx_i)
+            trk = self.trackers[trk_idx_i]
+            was_confirmed = trk.hits >= self.min_hits
+            will_recover_this_frame = (trk.hit_streak + 1) >= self.min_hits
+
+            if was_confirmed and not will_recover_this_frame:
+                trk.update_rewarming(det_xy[det_idx_i, :], det_extras[det_idx_i])
+            else:
+                trk.update(det_xy[det_idx_i, :], det_extras[det_idx_i])
+
             track_id = int(trk.id) + 1
             
             if trk.hit_streak >= self.min_hits:
                 # Fully confirmed with consecutive matches → output as matched
-                assigned[int(det_idx)] = track_id
+                assigned[det_idx_i] = track_id
                 matched_track_states[track_id] = trk.get_full_state()
             elif trk.hits > self.min_hits:
-                # Previously confirmed but re-warming (hit_streak < min_hits)
-                # → pass through the FULL DETECTION dict directly (no back-projection needed)
-                det = detections[int(det_idx)]
-                rewarming_entry = dict(det)  # Copy all detection fields (x, y, w, h, distance, confidence, obj_id, etc.)
+                # Previously confirmed but re-warming (hit_streak < min_hits).
+                # Keep detection image-space fields (bbox, etc.), but force world
+                # position to the KF prediction from this frame (pre-update).
+                det = detections[det_idx_i]
+                rewarming_entry = dict(det)  # Keep detection fields (x, y, w, h, distance, confidence, obj_id, etc.)
+                rewarming_entry["world_east_m"] = float(trk_xy[trk_idx_i, 0])
+                rewarming_entry["world_north_m"] = float(trk_xy[trk_idx_i, 1])
                 rewarming_entry["track_id"] = track_id
                 rewarming_entry["_is_rewarming"] = True  # Marker for bridge to skip back-projection
                 # Include full KF state for rewarming tracks
@@ -684,6 +751,9 @@ class WorldSpaceSort:
                 rewarming_entry["course_deg"] = full_state["course_deg"]
                 rewarming_entry["accel_east_mps2"] = full_state["accel_east_mps2"]
                 rewarming_entry["accel_north_mps2"] = full_state["accel_north_mps2"]
+                rewarming_entry["state_position_covariance_enu"] = full_state["state_position_covariance_enu"]
+                rewarming_entry["process_position_covariance_enu"] = full_state["process_position_covariance_enu"]
+                rewarming_entry["measurement_position_covariance_enu"] = full_state["measurement_position_covariance_enu"]
                 rewarming_tracks.append(rewarming_entry)
             # else: never confirmed (hits < min_hits), no output
 
@@ -722,6 +792,9 @@ class WorldSpaceSort:
                     "course_deg": full_state["course_deg"],
                     "accel_east_mps2": full_state["accel_east_mps2"],
                     "accel_north_mps2": full_state["accel_north_mps2"],
+                    "state_position_covariance_enu": full_state["state_position_covariance_enu"],
+                    "process_position_covariance_enu": full_state["process_position_covariance_enu"],
+                    "measurement_position_covariance_enu": full_state["measurement_position_covariance_enu"],
                 })
         
         # Add re-warming tracks to unmatched output
