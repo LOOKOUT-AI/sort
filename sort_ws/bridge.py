@@ -16,7 +16,7 @@ from .codec import decode_video_message, encode_video_message
 from .ego import EgoSmoother, EgoStateStore
 from .image_space_tracker import ImageSpaceSort
 from .world_space_tracker import WorldSpaceSort
-from .image_to_world import detection_to_world_latlon, enu_to_latlon, ENU
+from .image_to_world import detection_to_world_latlon, enu_to_latlon, latlon_to_enu_m, ENU
 from .world_to_image import world_to_image_space
 
 
@@ -220,6 +220,7 @@ async def _track_world_space(
     # ENU reference point (same for all tracks, set once per session)
     enu_ref_lat = float(local_ref.lat)
     enu_ref_lon = float(local_ref.lon)
+    ego_enu_from_ref = latlon_to_enu_m(local_ref, ego.latlon)
     
     # Process matched detections
     for det, track_id in zip(world_dets, assigned_ids):
@@ -236,6 +237,18 @@ async def _track_world_space(
         # Merge full KF kinematic state (velocity, acceleration, speed, course)
         kf_state = matched_track_states.get(int(track_id))
         if kf_state:
+            kf_enu = ENU(east_m=float(kf_state["east_m"]), north_m=float(kf_state["north_m"]))
+            kf_latlon = enu_to_latlon(local_ref, kf_enu)
+            kf_rel_ego = ENU(
+                east_m=float(kf_enu.east_m - ego_enu_from_ref.east_m),
+                north_m=float(kf_enu.north_m - ego_enu_from_ref.north_m),
+            )
+            det2["world_east_m"] = float(kf_enu.east_m)
+            det2["world_north_m"] = float(kf_enu.north_m)
+            det2["world_latitude"] = float(kf_latlon.lat)
+            det2["world_longitude"] = float(kf_latlon.lon)
+            det2["world_rel_ego_east_m"] = float(kf_rel_ego.east_m)
+            det2["world_rel_ego_north_m"] = float(kf_rel_ego.north_m)
             det2["vel_east_mps"] = kf_state["vel_east_mps"]
             det2["vel_north_mps"] = kf_state["vel_north_mps"]
             det2["speed_mps"] = kf_state["speed_mps"]
@@ -832,6 +845,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["cv", "ca"],
         help='Kalman filter motion model for world-space tracker. "cv" = constant velocity (4-state), "ca" = constant acceleration (6-state).',
     )
+    p.add_argument(
+        "--world-space-q-intensity",
+        dest="world_space_q_intensity",
+        type=float,
+        default=None,
+        help="Process-noise intensity for the world-space KF motion model. If omitted, uses the model-specific default.",
+    )
+    p.add_argument(
+        "--world-space-measurement-cross-var-m2",
+        dest="world_space_measurement_noise_cross_var_m2",
+        type=float,
+        default=None,
+        help="Base world-space measurement covariance across the radial line-of-sight direction, in square meters. If omitted, uses the model-specific default.",
+    )
+    p.add_argument(
+        "--world-space-measurement-radial-scale",
+        dest="world_space_measurement_noise_radial_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to the measurement covariance along the radial ego-to-target direction. 1.0 keeps measurement noise isotropic; values > 1 smooth radial jitter more aggressively.",
+    )
 
     # Per-category kinematic caps (always active; use a large value to effectively uncap)
     p.add_argument(
@@ -931,12 +965,18 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         world_space_gamma_confidence=args.world_space_gamma_confidence,
         world_space_new_track_min_confidence=args.world_space_new_track_min_confidence,
         world_space_kf_model=args.world_space_kf_model,
+        world_space_q_intensity=args.world_space_q_intensity,
+        world_space_measurement_noise_cross_var_m2=args.world_space_measurement_noise_cross_var_m2,
+        world_space_measurement_noise_radial_scale=args.world_space_measurement_noise_radial_scale,
         world_space_max_speed_boat_mps=args.world_space_max_speed_boat_mps,
         world_space_max_speed_other_mps=args.world_space_max_speed_other_mps,
         world_space_max_accel_boat_mps2=args.world_space_max_accel_boat_mps2,
         world_space_max_accel_other_mps2=args.world_space_max_accel_other_mps2,
     )
     print(f"[sort-ws] World-space KF model: {args.world_space_kf_model}")
+    print(f"[sort-ws] Q intensity: {args.world_space_q_intensity}")
+    print(f"[sort-ws] Measurement cross R var (m^2): {args.world_space_measurement_noise_cross_var_m2}")
+    print(f"[sort-ws] Measurement radial R scale: {args.world_space_measurement_noise_radial_scale}")
     print(f"[sort-ws] Speed caps: boat={args.world_space_max_speed_boat_mps} m/s, other={args.world_space_max_speed_other_mps} m/s")
     print(f"[sort-ws] Accel caps: boat={args.world_space_max_accel_boat_mps2} m/s², other={args.world_space_max_accel_other_mps2} m/s²")
 

@@ -122,13 +122,20 @@ In `sort_ws/world_space_tracker.py`:
 - **CV model (`KalmanCVPointTracker`)**
   - process noise intensity: `self._q_intensity`
   - process covariance matrix build: `_rebuild_dynamics()` where `self.kf.Q` is rebuilt from `dt`
-  - measurement covariance: `self.kf.R = np.eye(2, dtype=np.float32) * 4.0`
+  - measurement covariance: `_measurement_covariance_from_rel_enu()` rebuilds `self.kf.R` from the current relative ego-to-target direction, `measurement_noise_cross_var_m2`, and `measurement_noise_radial_scale`
   - initial state covariance: `self.kf.P`
 - **CA model (`KalmanCAPointTracker`)**
-  - process noise intensity: `self._q_jerk`
+  - process noise intensity: `self._q_intensity`
   - process covariance matrix build: `_rebuild_dynamics()` where `self.kf.Q` is rebuilt from `dt`
-  - measurement covariance: `self.kf.R = np.eye(2, dtype=np.float32) * 4.0`
+  - measurement covariance: `_measurement_covariance_from_rel_enu()` rebuilds `self.kf.R` from the current relative ego-to-target direction, `measurement_noise_cross_var_m2`, and `measurement_noise_radial_scale`
   - initial state covariance: `self.kf.P`
+
+Current world-space measurement covariance logic:
+
+- `cross_var = measurement_noise_cross_var_m2`
+- `radial_var = cross_var * measurement_noise_radial_scale`
+- build unit vectors for the current radial and cross-range directions from `world_rel_ego_east_m/world_rel_ego_north_m`
+- form `R = radial_var * (radial radial^T) + cross_var * (cross cross^T)` in ENU space
 
 **Q: What does "over time" mean when we say the KF trusts prediction or measurement more?**
 
@@ -174,7 +181,8 @@ What each field is used for:
 
 Jumpy distance causes jumpy ENU measurements, because `distance` is part of the image-to-world projection. That mainly affects the measurement `z`.
 
-- `Q` and `R` are fixed tuning parameters in the current implementation, so noisy distance does **not** directly change their numeric values
+- `Q` is a tunable process-noise family set by `q_intensity`
+- `R` is rebuilt every update from the current relative ego-to-target direction plus the tunables `measurement_noise_cross_var_m2` and `measurement_noise_radial_scale`
 - noisy distance does make `z` noisier, which can cause larger innovations `y = z - Hx⁻`
 - that can make the corrected state wiggle more if the filter is trusting measurements strongly
 - if the noise is bad enough to cause missed associations, the tracker may do several predict-only steps, which grows `P`
@@ -373,7 +381,7 @@ The tracker uses two counters to decide whether to output a track:
 | State | Condition | Meaning |
 |-------|-----------|---------|
 | **Matched** | `hit_streak >= min_hits` | Track has enough consecutive matches to be fully confirmed |
-| **Re-warming** | `hit_streak < min_hits` but `hits > min_hits` | Track was previously confirmed but lost consecutive matches; still outputs as unmatched using detection position |
+| **Re-warming** | `hit_streak < min_hits` but `hits > min_hits` | Track was previously confirmed but lost consecutive matches; still outputs as unmatched using KF world position plus current detection image-space fields |
 | **Unmatched (ghost)** | No detection this frame, but `hits >= min_hits` | Confirmed track with no detection; outputs using Kalman prediction |
 | **Warming** | `hits < min_hits` | New track building confidence; not yet output |
 
@@ -381,16 +389,15 @@ The tracker uses two counters to decide whether to output a track:
 
 | Track State | Position Source | Velocity / Acceleration Source |
 |-------------|-----------------|-------------------------------|
-| Matched | Detection position | KF state (post-update) |
-| Re-warming | Detection position (not Kalman prediction) | KF state (post-update) |
+| Matched | KF state after update for world-space fields; current detection for image-space bbox fields | KF state (post-update) |
+| Re-warming | KF prediction for world-space fields; current detection for image-space bbox fields | KF state (post-update, while status remains rewarming) |
 | Unmatched (ghost) | Kalman filter prediction | KF state (post-predict) |
 
-**Why re-warming uses detection position:**
+**Why the outputs are split between world-space and image-space fields:**
 
-When a previously-confirmed track matches a detection but hasn't yet rebuilt its `hit_streak` to `min_hits`, we use the detection position rather than the Kalman prediction. This is because:
-1. We have a fresh detection — use it
-2. The Kalman prediction may have drifted during the missed frames
-3. Re-warming tracks are output as `"unmatched"` status so downstream knows they're not fully re-confirmed yet
+1. **Matched** world tracks now emit the KF-corrected ENU/latlon position so the displayed world track reflects filter state rather than raw measurement truth.
+2. **Re-warming** world tracks keep the current detection image-space bbox fields, but leave world-space position on the KF-prediction side so downstream can compare "fresh bbox" vs "not fully re-confirmed world state."
+3. **Ghost** world tracks use predict-only KF world state and back-project image-space bbox values only for AR rendering.
 
 #### Track lifecycle and deletion
 
@@ -473,9 +480,9 @@ All original detection fields plus computed world fields and KF kinematic state:
 | `x`, `y`, `width`, `height` | From detection (pixels) |
 | `confidence`, `distance`, `heading`, `category` | From detection |
 | `obj_id` | From detection (original upstream ID) |
-| `world_latitude`, `world_longitude` | Computed from ego + bearing + distance |
-| `world_east_m`, `world_north_m` | ENU meters from local reference |
-| `world_rel_ego_east_m`, `world_rel_ego_north_m` | ENU meters relative to current ego |
+| `world_latitude`, `world_longitude` | Converted from the KF-corrected ENU state |
+| `world_east_m`, `world_north_m` | KF-corrected ENU position (post-update) |
+| `world_rel_ego_east_m`, `world_rel_ego_north_m` | Recomputed from KF ENU position relative to current ego |
 | `enu_ref_lat`, `enu_ref_lon` | Fixed ENU origin (first ego GPS fix, degrees) |
 | `vel_east_mps`, `vel_north_mps` | KF velocity in ENU (m/s) |
 | `speed_mps` | Derived speed: `hypot(vel_east, vel_north)` (m/s) |
@@ -513,7 +520,7 @@ Uses Kalman-predicted world position + stored bbox geometry + full KF kinematic 
 
 **4b. Re-warming tracks (detection matched, but hit_streak < min_hits)**
 
-**Passes through the full detection directly** (no back-projection needed) plus KF kinematic state:
+Uses the **current detection** for image-space bbox/confidence/category fields, but keeps the **KF-predicted world position**:
 
 | Field | Source |
 |-------|--------|
@@ -521,9 +528,9 @@ Uses Kalman-predicted world position + stored bbox geometry + full KF kinematic 
 | `distance` | **Directly from current detection** |
 | `confidence`, `heading`, `category` | **Directly from current detection** |
 | `obj_id` | **Directly from current detection** (preserved!) |
-| `world_east_m`, `world_north_m` | From current detection |
-| `world_latitude`, `world_longitude` | From current detection |
-| `world_rel_ego_east_m`, `world_rel_ego_north_m` | From current detection |
+| `world_east_m`, `world_north_m` | KF-predicted world position |
+| `world_latitude`, `world_longitude` | Converted from KF-predicted ENU |
+| `world_rel_ego_east_m`, `world_rel_ego_north_m` | Recomputed from KF-predicted ENU relative to ego |
 | `enu_ref_lat`, `enu_ref_lon` | Fixed ENU origin (first ego GPS fix, degrees) |
 | `vel_east_mps`, `vel_north_mps` | KF velocity in ENU (m/s) |
 | `speed_mps` | Derived speed (m/s) |
@@ -533,7 +540,7 @@ Uses Kalman-predicted world position + stored bbox geometry + full KF kinematic 
 | `tracked_space` | `"world_space"` |
 | `tracked_status` | `"unmatched"` |
 
-**Why re-warming tracks pass through detection directly**: Re-warming tracks have a matched detection this frame — they're only "unmatched" in terms of not having enough consecutive hits yet. Since we have fresh detection data, we use it directly instead of back-projecting from world position. This preserves all original fields including `obj_id`, avoids round-trip precision loss, and uses current confidence/heading/category values.
+**Why re-warming is mixed-source**: Re-warming tracks have a fresh detection this frame, so the bridge preserves the current image-space bbox, `obj_id`, confidence, heading, and category. But their world-space position remains on the KF-prediction side so matched/rewarming/ghost states can all be compared in the same ENU frame without snapping world position back to raw measurement truth.
 
 #### Why compute artificial bbox for ghost tracks?
 
@@ -547,47 +554,6 @@ For **re-warming tracks**, no back-projection is needed — we pass through the 
 
 This allows the AR view to continue showing a bbox overlay for the track even when the detector completely misses the object (ghost tracks).
 
-### Troubleshooting: "Why does world tracker output stick to simulated track?"
-
-**Q:** In `lookout-V2` track sim mode, I set distance noise offset to `30m` and frequency to `2 Hz`. I expected SORT world tracker output to look more smoothed by the Kalman filter, but the displayed world tracker track appears to stick exactly to the simulated track. Why?
-
-**A:** This is usually expected with the current pipeline. The most important reason is that in world-space mode, **matched track position output uses the current detection position**, not the KF-predicted position. The KF still runs and updates velocity/acceleration state, but the emitted matched position follows the measurement.
-
-Possible reasons (full list):
-
-1. **Matched world-space output is detection-position based by design**
-   - In `sort_ws/bridge.py`, `_track_world_space()` builds matched outputs from the detection dict (`det2 = dict(det)`), so position fields (`world_east_m`, `world_north_m`, and related world fields) are from the current detection projection.
-   - KF kinematic fields (velocity/speed/course/accel) are merged, but matched position is not replaced with KF position.
-
-2. **Continuous detections keep tracks in matched state**
-   - In tracker sim, if detections are present every frame (for example `detectionVisibleFrames=1`, `detectionHiddenFrames=0`), tracks remain matched continuously.
-   - You only see true KF-predicted position during ghost/unmatched frames (no matched detection).
-
-3. **Re-warming behavior also prefers detection position**
-   - Re-warming tracks (matched detection, but not enough consecutive hit streak yet) are passed through using detection fields, not back-projected KF ghost position.
-   - This can look like "unmatched" output that still follows detections.
-
-4. **Noise is injected upstream into distance measurement used by both sides**
-   - `lookout-V2` simulation applies noise to bbox `distance` before sending.
-   - The world tracker then projects world position from that noisy measurement, so displayed track can remain tightly coupled to simulated noisy input.
-
-5. **Frontend smoothing may be disabled**
-   - In `lookout-V2/src/aerialCVObjects.js`, default smoothing mode is effectively pass-through (`_smoothBy = 'none'`), so frontend visualization does not add extra positional smoothing.
-
-6. **You may be comparing against ground-truth overlay**
-   - Track sim can also render ground-truth CV objects in aerial view. If both layers are visible, outputs can appear identical or nearly identical.
-
-7. **Tracked-space mode may not be what you think**
-   - If UI mode is `auto`, output selection can switch between image/world spaces depending on availability.
-   - Confirm you are explicitly observing world-space track output.
-
-8. **2 Hz sinusoidal noise is coherent, not random**
-   - A deterministic sinusoid at sim tick rate can look like a stable wobble rather than random jitter. With per-frame matches, measurement-following output still appears "locked" to the signal.
-
-9. **Stable association reduces visible KF-only effects**
-   - In easy single-target cases with stable matching and no dropouts, there is little need to coast on prediction. Visual smoothing from KF position is therefore less obvious.
-
-**Practical implication:** if you want visibly smoothed **position** on matched frames, bridge behavior must be changed to emit KF position for matched world-space tracks (or made configurable), instead of forwarding matched detection position fields.
 
 ### Parameters (what they mean)
 
@@ -612,6 +578,9 @@ Possible reasons (full list):
 - **`--world-space-beta-heading`**: weight for heading-difference cost term (if target heading exists)
 - **`--world-space-gamma-confidence`**: weight for confidence penalty term
 - **`--world-space-new-track-min-confidence`**: minimum confidence to spawn a new track
+- **`--world-space-q-intensity`**: process-noise intensity for the world-space KF motion model; larger values make motion more maneuver-friendly but noisier
+- **`--world-space-measurement-cross-var-m2`**: baseline measurement covariance in the cross-range direction
+- **`--world-space-measurement-radial-scale`**: scales radial measurement covariance relative to the cross-range baseline, producing anisotropic `R`
 
 #### Per-category kinematic caps
 

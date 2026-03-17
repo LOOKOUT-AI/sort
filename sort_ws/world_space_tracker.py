@@ -46,11 +46,42 @@ def _clamp_vector(vx: float, vy: float, vmax: float) -> Tuple[float, float]:
     return vx * s, vy * s
 
 
+def _measurement_covariance_from_rel_enu(
+    rel_east_m: float,
+    rel_north_m: float,
+    cross_var_m2: float,
+    radial_scale: float,
+) -> np.ndarray:
+    """Build a 2x2 ENU measurement covariance aligned to radial/cross-range axes."""
+    cross_var = max(1e-6, float(cross_var_m2))
+    radial_var = max(1e-6, cross_var * max(1e-6, float(radial_scale)))
+
+    try:
+        re = float(rel_east_m)
+        rn = float(rel_north_m)
+    except Exception:
+        iso = max(cross_var, radial_var)
+        return np.eye(2, dtype=np.float32) * iso
+
+    norm = math.hypot(re, rn)
+    if norm < 1e-6 or not math.isfinite(norm):
+        iso = max(cross_var, radial_var)
+        return np.eye(2, dtype=np.float32) * iso
+
+    radial = np.array([re / norm, rn / norm], dtype=np.float32)
+    cross = np.array([-radial[1], radial[0]], dtype=np.float32)
+    rr_t = np.outer(radial, radial)
+    cc_t = np.outer(cross, cross)
+    return (radial_var * rr_t + cross_var * cc_t).astype(np.float32)
+
+
 @dataclass
 class WorldTrackExtras:
     confidence: float = float("nan")
     category: Optional[str] = None
     heading_deg: float = float("nan")  # if the detector provides a target heading estimate
+    rel_east_m: float = float("nan")
+    rel_north_m: float = float("nan")
     # Store last known bbox geometry for back-projection of unmatched tracks
     last_y_px: float = float("nan")
     last_width_px: float = float("nan")
@@ -72,10 +103,13 @@ class KalmanCVPointTracker:
         meas_enu: np.ndarray,
         extras: WorldTrackExtras,
         *,
+        q_intensity: float = 10.0,
+        measurement_noise_cross_var_m2: float = 160.0,
         max_speed_boat_mps: float = 50.0,
         max_speed_other_mps: float = 50.0,
         max_accel_boat_mps2: float = 20.0,   # accepted but unused (CV has no accel state)
         max_accel_other_mps2: float = 20.0,  # accepted but unused
+        measurement_noise_radial_scale: float = 1.0,
     ):
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
         self.kf.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
@@ -86,15 +120,17 @@ class KalmanCVPointTracker:
         # seconds (~0.03–0.05) rather than the old hardcoded dt=1.  Q_vv scales
         # as q * dt², so q ≈ 1/dt² ≈ 400 restores comparable per-step noise.
         # self._q_intensity: float = 400.0
-        self._q_intensity: float = 10.0
+        self._q_intensity = max(0.0, float(q_intensity))
 
         # Initialise F and Q with a nominal dt so filterpy internals have the
         # correct shape/dtype.  They will be overwritten on the first predict().
         self._rebuild_dynamics(_DEFAULT_DT_S)
 
-        # covariances: tuned for stability (similar spirit to SORT)
-        # self.kf.R = np.eye(2, dtype=np.float32) * 4.0
-        self.kf.R = np.eye(2, dtype=np.float32) * 160.0
+        # Measurement covariance. Cross-range keeps the legacy tuned variance,
+        # while radial variance can be scaled independently to smooth range jitter.
+        self.measurement_noise_cross_var_m2 = max(1e-6, float(measurement_noise_cross_var_m2))
+        self.measurement_noise_radial_scale = max(1e-6, float(measurement_noise_radial_scale))
+        self.kf.R = np.eye(2, dtype=np.float32) * self.measurement_noise_cross_var_m2
         self.kf.P = np.eye(4, dtype=np.float32) * 10.0
         self.kf.P[2:, 2:] *= 1000.0  # velocities initially very uncertain
 
@@ -111,6 +147,7 @@ class KalmanCVPointTracker:
         # Per-category speed caps (always active; use a large value to effectively uncap)
         self.max_speed_boat_mps = float(max_speed_boat_mps)
         self.max_speed_other_mps = float(max_speed_other_mps)
+        self._update_measurement_covariance(extras)
 
     # ------------------------------------------------------------------
     # State clamping (applied after both predict and update)
@@ -129,6 +166,25 @@ class KalmanCVPointTracker:
         ve_c, vn_c = _clamp_vector(ve, vn, max_speed)
         x[2, 0] = ve_c
         x[3, 0] = vn_c
+
+    def _update_measurement_covariance(self, extras: WorldTrackExtras) -> None:
+        self.kf.R = _measurement_covariance_from_rel_enu(
+            extras.rel_east_m,
+            extras.rel_north_m,
+            self.measurement_noise_cross_var_m2,
+            self.measurement_noise_radial_scale,
+        )
+
+    def set_measurement_noise_radial_scale(self, value: float) -> None:
+        self.measurement_noise_radial_scale = max(1e-6, float(value))
+        self._update_measurement_covariance(self.extras)
+
+    def set_measurement_noise_cross_var_m2(self, value: float) -> None:
+        self.measurement_noise_cross_var_m2 = max(1e-6, float(value))
+        self._update_measurement_covariance(self.extras)
+
+    def set_q_intensity(self, value: float) -> None:
+        self._q_intensity = max(0.0, float(value))
 
     # ------------------------------------------------------------------
     # Dynamics rebuilding (called every predict with real dt in seconds)
@@ -165,6 +221,7 @@ class KalmanCVPointTracker:
         self.time_since_update = 0
         self.hits += 1
         self.hit_streak += 1
+        self._update_measurement_covariance(extras)
         z = np.array([[float(meas_enu[0])], [float(meas_enu[1])]], dtype=np.float32)
         self.kf.update(z)
         self._clamp_state()
@@ -176,6 +233,7 @@ class KalmanCVPointTracker:
         self.hits += 1
         self.hit_streak += 1
 
+        self._update_measurement_covariance(extras)
         z = np.array([[float(meas_enu[0])], [float(meas_enu[1])]], dtype=np.float32)
         self.kf.update(z)
         self._clamp_state()
@@ -239,10 +297,13 @@ class KalmanCAPointTracker:
         meas_enu: np.ndarray,
         extras: WorldTrackExtras,
         *,
+        q_intensity: float = 1.0,
+        measurement_noise_cross_var_m2: float = 4.0,
         max_speed_boat_mps: float = 50.0,
         max_speed_other_mps: float = 50.0,
         max_accel_boat_mps2: float = 20.0,
         max_accel_other_mps2: float = 20.0,
+        measurement_noise_radial_scale: float = 1.0,
     ):
         self.kf = KalmanFilter(dim_x=6, dim_z=2)
         self.kf.H = np.array(
@@ -253,14 +314,17 @@ class KalmanCAPointTracker:
 
         # Process noise intensity (continuous white-noise jerk spectral density).
         # F and Q are rebuilt every predict() call with the real dt.
-        self._q_jerk: float = 1.0
+        self._q_intensity = max(0.0, float(q_intensity))
 
         # Initialise F and Q with a nominal dt so filterpy internals have the
         # correct shape/dtype.  They will be overwritten on the first predict().
         self._rebuild_dynamics(_DEFAULT_DT_S)
 
-        # Measurement noise: same sensor as CV, same R.
-        self.kf.R = np.eye(2, dtype=np.float32) * 4.0
+        # Measurement covariance. Cross-range keeps the legacy tuned variance,
+        # while radial variance can be scaled independently to smooth range jitter.
+        self.measurement_noise_cross_var_m2 = max(1e-6, float(measurement_noise_cross_var_m2))
+        self.measurement_noise_radial_scale = max(1e-6, float(measurement_noise_radial_scale))
+        self.kf.R = np.eye(2, dtype=np.float32) * self.measurement_noise_cross_var_m2
 
         # Initial state covariance.
         self.kf.P = np.eye(6, dtype=np.float32) * 10.0
@@ -285,6 +349,7 @@ class KalmanCAPointTracker:
         self.max_speed_other_mps = float(max_speed_other_mps)
         self.max_accel_boat_mps2 = float(max_accel_boat_mps2)
         self.max_accel_other_mps2 = float(max_accel_other_mps2)
+        self._update_measurement_covariance(extras)
 
     # ------------------------------------------------------------------
     # State clamping (applied after both predict and update)
@@ -309,6 +374,25 @@ class KalmanCAPointTracker:
         ae_c, an_c = _clamp_vector(ae, an, max_accel)
         x[4, 0] = ae_c
         x[5, 0] = an_c
+
+    def _update_measurement_covariance(self, extras: WorldTrackExtras) -> None:
+        self.kf.R = _measurement_covariance_from_rel_enu(
+            extras.rel_east_m,
+            extras.rel_north_m,
+            self.measurement_noise_cross_var_m2,
+            self.measurement_noise_radial_scale,
+        )
+
+    def set_measurement_noise_radial_scale(self, value: float) -> None:
+        self.measurement_noise_radial_scale = max(1e-6, float(value))
+        self._update_measurement_covariance(self.extras)
+
+    def set_measurement_noise_cross_var_m2(self, value: float) -> None:
+        self.measurement_noise_cross_var_m2 = max(1e-6, float(value))
+        self._update_measurement_covariance(self.extras)
+
+    def set_q_intensity(self, value: float) -> None:
+        self._q_intensity = max(0.0, float(value))
 
     # ------------------------------------------------------------------
     # Dynamics rebuilding (called every predict with real dt in seconds)
@@ -339,7 +423,7 @@ class KalmanCAPointTracker:
             dtype=np.float32,
         )
         # fmt: on
-        q_jerk = self._q_jerk
+        q_jerk = self._q_intensity
         g = np.array([dt**3 / 6.0, dt**2 / 2.0, dt], dtype=np.float32)
         q_axis = q_jerk * np.outer(g, g)  # 3×3
         # Assemble 6×6 block-diagonal Q for [e, n, ve, vn, ae, an] ordering
@@ -358,6 +442,7 @@ class KalmanCAPointTracker:
         self.time_since_update = 0
         self.hits += 1
         self.hit_streak += 1
+        self._update_measurement_covariance(extras)
         z = np.array([[float(meas_enu[0])], [float(meas_enu[1])]], dtype=np.float32)
         self.kf.update(z)
         self._clamp_state()
@@ -369,6 +454,7 @@ class KalmanCAPointTracker:
         self.hits += 1
         self.hit_streak += 1
 
+        self._update_measurement_covariance(extras)
         z = np.array([[float(meas_enu[0])], [float(meas_enu[1])]], dtype=np.float32)
         self.kf.update(z)
         self._clamp_state()
@@ -534,6 +620,9 @@ class WorldSpaceSort:
         world_space_gamma_confidence: float = 0.0,
         world_space_new_track_min_confidence: float = 0.0,
         world_space_kf_model: str = "cv",
+        world_space_q_intensity: Optional[float] = None,
+        world_space_measurement_noise_cross_var_m2: Optional[float] = None,
+        world_space_measurement_noise_radial_scale: float = 1.0,
         # Per-category kinematic caps (always active; use a large value to effectively uncap).
         world_space_max_speed_boat_mps: float = 50.0,
         world_space_max_speed_other_mps: float = 50.0,
@@ -554,8 +643,18 @@ class WorldSpaceSort:
         self.kf_model = kf_model
         self._tracker_class = KalmanCAPointTracker if kf_model == "ca" else KalmanCVPointTracker
 
+        default_q_intensity = 1.0 if kf_model == "ca" else 10.0
+        default_measurement_noise_cross_var_m2 = 4.0 if kf_model == "ca" else 160.0
+
         # Kinematic caps forwarded to each tracker instance.
         self._tracker_kwargs: Dict[str, float] = {
+            "q_intensity": float(default_q_intensity if world_space_q_intensity is None else world_space_q_intensity),
+            "measurement_noise_cross_var_m2": float(
+                default_measurement_noise_cross_var_m2
+                if world_space_measurement_noise_cross_var_m2 is None
+                else world_space_measurement_noise_cross_var_m2
+            ),
+            "measurement_noise_radial_scale": float(world_space_measurement_noise_radial_scale),
             "max_speed_boat_mps": float(world_space_max_speed_boat_mps),
             "max_speed_other_mps": float(world_space_max_speed_other_mps),
             "max_accel_boat_mps2": float(world_space_max_accel_boat_mps2),
@@ -579,6 +678,14 @@ class WorldSpaceSort:
             heading_f = float(heading)
         except Exception:
             heading_f = float("nan")
+        try:
+            rel_east_m = float(det.get("world_rel_ego_east_m", float("nan")))
+        except Exception:
+            rel_east_m = float("nan")
+        try:
+            rel_north_m = float(det.get("world_rel_ego_north_m", float("nan")))
+        except Exception:
+            rel_north_m = float("nan")
         # Extract bbox geometry for back-projection of unmatched tracks
         try:
             y_px = float(det.get("y", float("nan")))
@@ -596,6 +703,8 @@ class WorldSpaceSort:
             confidence=conf_f,
             category=det.get("category"),
             heading_deg=heading_f,
+            rel_east_m=rel_east_m,
+            rel_north_m=rel_north_m,
             last_y_px=y_px,
             last_width_px=width_px,
             last_height_px=height_px,
@@ -818,6 +927,9 @@ class WorldSpaceSort:
         "max_age": int,
         "min_hits": int,
         "max_distance_m": float,
+        "q_intensity": float,
+        "measurement_noise_cross_var_m2": float,
+        "measurement_noise_radial_scale": float,
         "max_speed_boat_mps": float,
         "max_speed_other_mps": float,
         "max_accel_boat_mps2": float,
@@ -830,6 +942,9 @@ class WorldSpaceSort:
             "max_age": self.max_age,
             "min_hits": self.min_hits,
             "max_distance_m": self.max_distance_m,
+            "q_intensity": self._tracker_kwargs["q_intensity"],
+            "measurement_noise_cross_var_m2": self._tracker_kwargs["measurement_noise_cross_var_m2"],
+            "measurement_noise_radial_scale": self._tracker_kwargs["measurement_noise_radial_scale"],
             "max_speed_boat_mps": self._tracker_kwargs["max_speed_boat_mps"],
             "max_speed_other_mps": self._tracker_kwargs["max_speed_other_mps"],
             "max_accel_boat_mps2": self._tracker_kwargs["max_accel_boat_mps2"],
@@ -862,7 +977,10 @@ class WorldSpaceSort:
                 # Update all existing tracker instances so the new cap
                 # takes effect immediately.
                 for trk in self.trackers:
-                    if hasattr(trk, key):
+                    setter_name = f"set_{key}"
+                    if hasattr(trk, setter_name):
+                        getattr(trk, setter_name)(val)
+                    elif hasattr(trk, key):
                         setattr(trk, key, val)
 
         return self.get_tunable_params()
