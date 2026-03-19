@@ -410,6 +410,8 @@ class ImageSpaceSort:
                             "distance": float(trk.extras.distance) if not np.isnan(trk.extras.distance) else None,
                             "heading": float(trk.extras.heading) if not np.isnan(trk.extras.heading) else None,
                             "category": trk.extras.category,
+                            "unmatched_frames": int(trk.time_since_update),
+                            "tracker_max_age": int(self.max_age),
                         })
             for t in reversed(to_del):
                 self.trackers.pop(t)
@@ -500,6 +502,9 @@ class ImageSpaceSort:
                     "distance": float(trk.extras.distance) if not np.isnan(trk.extras.distance) else None,
                     "heading": float(trk.extras.heading) if not np.isnan(trk.extras.heading) else None,
                     "category": trk.extras.category,
+                    "unmatched_frames": 0,
+                    "tracker_max_age": int(self.max_age),
+                    "_is_rewarming": True,
                 })
             # else: never confirmed (hits < min_hits), no output
 
@@ -532,6 +537,8 @@ class ImageSpaceSort:
                     "distance": float(trk.extras.distance) if not np.isnan(trk.extras.distance) else None,
                     "heading": float(trk.extras.heading) if not np.isnan(trk.extras.heading) else None,
                     "category": trk.extras.category,
+                    "unmatched_frames": int(trk.time_since_update),
+                    "tracker_max_age": int(self.max_age),
                 })
         
         # Add re-warming tracks to unmatched output

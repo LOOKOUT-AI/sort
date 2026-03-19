@@ -764,6 +764,8 @@ class WorldSpaceSort:
                             "state_position_covariance_enu": full_state["state_position_covariance_enu"],
                             "process_position_covariance_enu": full_state["process_position_covariance_enu"],
                             "measurement_position_covariance_enu": full_state["measurement_position_covariance_enu"],
+                            "unmatched_frames": int(trk.time_since_update),
+                            "tracker_max_age": int(self.max_age),
                         }
                         unmatched_tracks.append(entry)
             for t in reversed(to_del):
@@ -852,6 +854,8 @@ class WorldSpaceSort:
                 rewarming_entry["world_north_m"] = float(trk_xy[trk_idx_i, 1])
                 rewarming_entry["track_id"] = track_id
                 rewarming_entry["_is_rewarming"] = True  # Marker for bridge to skip back-projection
+                rewarming_entry["unmatched_frames"] = 0
+                rewarming_entry["tracker_max_age"] = int(self.max_age)
                 # Include full KF state for rewarming tracks
                 full_state = trk.get_full_state()
                 rewarming_entry["vel_east_mps"] = full_state["vel_east_mps"]
@@ -904,6 +908,8 @@ class WorldSpaceSort:
                     "state_position_covariance_enu": full_state["state_position_covariance_enu"],
                     "process_position_covariance_enu": full_state["process_position_covariance_enu"],
                     "measurement_position_covariance_enu": full_state["measurement_position_covariance_enu"],
+                    "unmatched_frames": int(trk.time_since_update),
+                    "tracker_max_age": int(self.max_age),
                 })
         
         # Add re-warming tracks to unmatched output

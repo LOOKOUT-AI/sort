@@ -159,8 +159,10 @@ def _track_image_space(bboxes: list, tracker: ImageSpaceSort) -> List[Dict[str, 
     # Process unmatched but confirmed tracks (predicted state)
     for unmatched in unmatched_tracks:
         det2 = dict(unmatched)
+        is_rewarming = det2.pop("_is_rewarming", False)
         det2["tracked_space"] = "image_space"
         det2["tracked_status"] = "unmatched"
+        det2["unmatched_status"] = "rewarming" if is_rewarming else "ghost"
         tracked_bboxes.append(det2)
     
     return tracked_bboxes
