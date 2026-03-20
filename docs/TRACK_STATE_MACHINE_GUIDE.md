@@ -42,51 +42,54 @@ Those counters are what actually drive transitions.
 
 ```mermaid
 flowchart TD
-    subgraph inputs [InputsAndThresholds]
-        liveFilter["lookout-V2 live render filter: bbox.confidence >= 0.1"]
-        newTrackGate["sort birth gate: detection confidence >= *_new_track_min_confidence"]
-        imageGate["image-space association gate: IOU >= image_space_iou_threshold"]
-        worldGate["world-space association gate: distance <= world_space_max_distance_m"]
-        matchDecision["A frame counts as matched only if association succeeds"]
-        missDecision["A frame counts as missed when no detection passes association"]
+    subgraph preconditions [PreconditionsAndMatchDecision]
+        frontendFilter["lookout-V2 live render filter\nbbox.confidence >= 0.1 to be drawn"]
+        newTrackGate["Birth gate\nunmatched detection confidence >= *_new_track_min_confidence"]
+        imageGate["Image-space gate\nIOU >= image_space_iou_threshold"]
+        worldGate["World-space gate\ndistance <= world_space_max_distance_m"]
+        assignStep["Association + Hungarian assignment"]
+        matchedFrame["Matched frame\nvalid detection-track association"]
+        missedFrame["Missed frame\nno valid association for that tracker"]
     end
 
-    subgraph states [TrackStates]
-        noTrack["NoTrack"]
-        warming["WarmingOrUnconfirmed"]
-        matched["Matched"]
-        ghost["Ghost"]
-        rewarming["Rewarming"]
-        deleted["Deleted"]
+    subgraph states [StateMachine]
+        noTrack["NoTrack\nno tracker exists"]
+        warming["WarmingOrUnconfirmed\ntracker exists but not confirmed"]
+        matched["Matched\nhit_streak >= min_hits"]
+        ghost["Ghost\nconfirmed but unmatched"]
+        rewarming["Rewarming\npreviously confirmed, matched again,\nbut hit_streak < min_hits"]
+        deleted["Deleted\ntracker removed"]
     end
 
-    liveFilter -.-> matchDecision
-    newTrackGate --> warming
-    imageGate --> matchDecision
-    worldGate --> matchDecision
-    matchDecision --> matched
-    missDecision --> ghost
+    frontendFilter -.-> assignStep
+    imageGate --> assignStep
+    worldGate --> assignStep
+    assignStep --> matchedFrame
+    assignStep --> missedFrame
 
-    noTrack -->|"unmatched detection creates a new tracker and passes *_new_track_min_confidence"| warming
-    noTrack -->|"detection filtered out or no valid association candidate"| noTrack
+    noTrack -->|"unmatched detection passes new-track gate /\ncreate tracker, initialize hits=1, hit_streak=1, time_since_update=0"| warming
+    noTrack -->|"no valid detection, filtered detection, or confidence below birth gate /\nstay without tracker"| noTrack
 
-    warming -->|"another consecutive matched frame and hit_streak < min_hits"| warming
-    warming -->|"matched frame makes hit_streak >= min_hits"| matched
-    warming -->|"missed frame before confirmation; stays internal only"| warming
-    warming -->|"time_since_update > max_age"| deleted
+    warming -->|"matchedFrame and hit_streak + 1 < min_hits /\nupdate(), hits += 1, hit_streak += 1, still internal only"| warming
+    warming -->|"matchedFrame and hit_streak + 1 >= min_hits /\nupdate(), hits += 1, hit_streak reaches min_hits, begin emitting matched"| matched
+    warming -->|"missedFrame and time_since_update <= max_age /\npredict(), time_since_update += 1, hit_streak reset to 0 on miss, still unconfirmed and not output"| warming
+    warming -->|"time_since_update > max_age /\nremove tracker without ever confirming"| deleted
 
-    matched -->|"one missed frame after confirmation"| ghost
-    matched -->|"matched again and hit_streak stays >= min_hits"| matched
+    matched -->|"matchedFrame /\nupdate(), hits += 1, hit_streak += 1, remain confirmed and emit tracked_status=matched"| matched
+    matched -->|"first missedFrame after confirmation /\npredict(), time_since_update += 1, hit_streak resets to 0, emit unmatched confirmed track"| ghost
 
-    ghost -->|"first recovery match and hit_streak + 1 < min_hits"| rewarming
-    ghost -->|"recovery match and hit_streak + 1 >= min_hits; practical direct jump usually only when min_hits = 1"| matched
-    ghost -->|"another missed frame while time_since_update <= max_age"| ghost
-    ghost -->|"time_since_update > max_age"| deleted
+    ghost -->|"missedFrame and time_since_update <= max_age /\npredict(), time_since_update += 1, keep emitting ghost/predicted track"| ghost
+    ghost -->|"matchedFrame and hit_streak + 1 < min_hits /\nrecovery match, update_rewarming() or update(), time_since_update=0, hit_streak restarts from 1, emit rewarming"| rewarming
+    ghost -->|"matchedFrame and hit_streak + 1 >= min_hits /\nrecovery match immediately satisfies confirmation, emit matched directly (usually only when min_hits=1)"| matched
+    ghost -->|"time_since_update > max_age /\nremove tracker after ghost lifetime expires"| deleted
 
-    rewarming -->|"consecutive matched frame but hit_streak < min_hits"| rewarming
-    rewarming -->|"matched frame makes hit_streak >= min_hits"| matched
-    rewarming -->|"miss again before rebuilding streak"| ghost
-    rewarming -->|"time_since_update > max_age"| deleted
+    rewarming -->|"matchedFrame and hit_streak + 1 < min_hits /\nconsecutive recovery match, hits += 1, hit_streak += 1, keep emitting rewarming"| rewarming
+    rewarming -->|"matchedFrame and hit_streak + 1 >= min_hits /\nrecovered enough consecutive matches, emit tracked_status=matched again"| matched
+    rewarming -->|"missedFrame and time_since_update <= max_age /\npredict(), hit_streak resets, fall back to ghost output"| ghost
+    rewarming -->|"time_since_update > max_age /\nremove tracker if later misses exceed max_age"| deleted
+
+    matchedFrame -. "A frame can only be matched if it passes image/world gating and wins association" .-> matched
+    missedFrame -. "A miss means no valid association this frame; frontend may also hide low-confidence boxes even when backend tracker still exists" .-> ghost
 ```
 
 ## What Counts As A Match
