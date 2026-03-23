@@ -392,7 +392,10 @@ async def _process_video_payload(
 
     vm.metadata["bboxes"] = tracked_bboxes
     vm.metadata["tracked"] = True
-    vm.metadata["path_finding"] = path_finding_payload
+    if path_finding_payload is not None:
+        vm.metadata["path_finding"] = path_finding_payload
+    else:
+        vm.metadata.pop("path_finding", None)
     out_payload = encode_video_message(vm.metadata, vm.jpeg_bytes)
     await video_hub.broadcast(out_payload)
 
