@@ -10,12 +10,14 @@ from .image_to_world import ENU, right_fwd_to_enu_m
 
 
 GridCoord = Tuple[int, int]
+CellCostMap = Dict[GridCoord, float]
 PATH_FINDING_MODES = (
     "astar_enu",
     "astar_ego_relative",
     "theta_enu",
     "theta_ego_relative",
 )
+VELOCITY_ARROW_PROJECTION_MODES = ("tcpa", "manual")
 
 
 def _clamp(value: Any, lo: float, hi: float, *, integer: bool = False):
@@ -46,6 +48,11 @@ def _coerce_mode(value: Any, default: str) -> str:
     return mode if mode in PATH_FINDING_MODES else default
 
 
+def _coerce_velocity_arrow_mode(value: Any, default: str) -> str:
+    mode = str(value or default).strip().lower()
+    return mode if mode in VELOCITY_ARROW_PROJECTION_MODES else default
+
+
 @dataclass(frozen=True)
 class PathFindingParams:
     enabled: bool = True
@@ -54,8 +61,12 @@ class PathFindingParams:
     cardinal_cost: float = 1.0
     diagonal_cost: float = 1.4
     run_every_n_frames: int = 5
-    obstacle_projection_time_s: float = 10.0
-    obstacle_expansion_radius_cells: int = 0
+    velocity_arrow_projection_mode: str = "tcpa"
+    velocity_arrow_projection_time_s: float = 10.0
+    track_current_position_cost: float = 1.0
+    track_future_collision_cost: float = 3.0
+    track_cost_expansion_radius_cells: int = 2
+    track_cost_expansion_decay: float = 0.5
     mode: str = "astar_enu"
     show_debug_grid: bool = True
 
@@ -69,16 +80,35 @@ class PathFindingParams:
             cardinal_cost=_clamp(raw.get("cardinal_cost", cls.cardinal_cost), 0.1, 20.0),
             diagonal_cost=_clamp(raw.get("diagonal_cost", cls.diagonal_cost), 0.1, 30.0),
             run_every_n_frames=_clamp(raw.get("run_every_n_frames", cls.run_every_n_frames), 1, 20, integer=True),
-            obstacle_projection_time_s=_clamp(
-                raw.get("obstacle_projection_time_s", cls.obstacle_projection_time_s),
+            velocity_arrow_projection_mode=_coerce_velocity_arrow_mode(
+                raw.get("velocity_arrow_projection_mode", cls.velocity_arrow_projection_mode),
+                cls.velocity_arrow_projection_mode,
+            ),
+            velocity_arrow_projection_time_s=_clamp(
+                raw.get("velocity_arrow_projection_time_s", cls.velocity_arrow_projection_time_s),
                 0.0,
                 30.0,
             ),
-            obstacle_expansion_radius_cells=_clamp(
-                raw.get("obstacle_expansion_radius_cells", cls.obstacle_expansion_radius_cells),
+            track_current_position_cost=_clamp(
+                raw.get("track_current_position_cost", cls.track_current_position_cost),
+                0.0,
+                20.0,
+            ),
+            track_future_collision_cost=_clamp(
+                raw.get("track_future_collision_cost", cls.track_future_collision_cost),
+                0.0,
+                50.0,
+            ),
+            track_cost_expansion_radius_cells=_clamp(
+                raw.get("track_cost_expansion_radius_cells", cls.track_cost_expansion_radius_cells),
                 0,
                 10,
                 integer=True,
+            ),
+            track_cost_expansion_decay=_clamp(
+                raw.get("track_cost_expansion_decay", cls.track_cost_expansion_decay),
+                0.0,
+                1.0,
             ),
             mode=_coerce_mode(raw.get("mode", cls.mode), cls.mode),
             show_debug_grid=_coerce_bool(raw.get("show_debug_grid", cls.show_debug_grid), cls.show_debug_grid),
@@ -92,19 +122,26 @@ class PathFindingParams:
             "cardinal_cost": float(self.cardinal_cost),
             "diagonal_cost": float(self.diagonal_cost),
             "run_every_n_frames": int(self.run_every_n_frames),
-            "obstacle_projection_time_s": float(self.obstacle_projection_time_s),
-            "obstacle_expansion_radius_cells": int(self.obstacle_expansion_radius_cells),
+            "velocity_arrow_projection_mode": str(self.velocity_arrow_projection_mode),
+            "velocity_arrow_projection_time_s": float(self.velocity_arrow_projection_time_s),
+            "track_current_position_cost": float(self.track_current_position_cost),
+            "track_future_collision_cost": float(self.track_future_collision_cost),
+            "track_cost_expansion_radius_cells": int(self.track_cost_expansion_radius_cells),
+            "track_cost_expansion_decay": float(self.track_cost_expansion_decay),
             "mode": str(self.mode),
             "show_debug_grid": bool(self.show_debug_grid),
         }
 
 
-@dataclass(frozen=True)
+@dataclass
 class TrackedObstacle:
     position_enu: ENU
     vel_east_mps: float = 0.0
     vel_north_mps: float = 0.0
     speed_mps: float = 0.0
+    track_id: Optional[int] = None
+    source_record: Optional[Dict[str, Any]] = None
+    tcpa_s: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +210,8 @@ class PathFindingResult:
     start_cell: List[int]
     goal_cell: List[int]
     obstacle_cells: List[List[int]]
+    cost_cells: List[List[float]]
+    max_cell_cost: float
     path_cells: List[List[int]]
     obstacle_count: int
     used_cached_result: bool = False
@@ -205,10 +244,13 @@ class PathFindingResult:
                     "start_cell": list(self.start_cell),
                     "goal_cell": list(self.goal_cell),
                     "obstacle_cells": [list(cell) for cell in self.obstacle_cells],
+                    "cost_cells": [list(cell) for cell in self.cost_cells],
+                    "max_cell_cost": float(self.max_cell_cost),
                     "path_cells": [list(cell) for cell in self.path_cells],
                 }
             )
         return payload
+
 
 def _normalize_enu_basis(east_m: float, north_m: float) -> Tuple[float, float]:
     mag = math.hypot(float(east_m), float(north_m))
@@ -271,37 +313,76 @@ def _reconstruct_path(came_from: Dict[GridCoord, GridCoord], current: GridCoord)
     return path
 
 
-def _expand_cells(cells: Iterable[GridCoord], radius_cells: int) -> Set[GridCoord]:
-    radius = max(0, int(radius_cells))
-    expanded: Set[GridCoord] = set()
-    for cell_x, cell_y in cells:
-        for dx in range(-radius, radius + 1):
-            for dy in range(-radius, radius + 1):
-                expanded.add((cell_x + dx, cell_y + dy))
+def _search_bounds(start: GridCoord, goal: GridCoord, padding_cells: int) -> Tuple[int, int, int, int]:
+    xs = [start[0], goal[0]]
+    ys = [start[1], goal[1]]
+    return (
+        min(xs) - padding_cells,
+        max(xs) + padding_cells,
+        min(ys) - padding_cells,
+        max(ys) + padding_cells,
+    )
+
+
+def _in_bounds(cell: GridCoord, bounds: Tuple[int, int, int, int]) -> bool:
+    min_x, max_x, min_y, max_y = bounds
+    return min_x <= cell[0] <= max_x and min_y <= cell[1] <= max_y
+
+
+def _bounds_to_dict(bounds: Tuple[int, int, int, int]) -> Dict[str, int]:
+    min_x, max_x, min_y, max_y = bounds
+    return {
+        "min_x": int(min_x),
+        "max_x": int(max_x),
+        "min_y": int(min_y),
+        "max_y": int(max_y),
+    }
+
+
+@dataclass(frozen=True)
+class AStarGridResult:
+    start_cell: GridCoord
+    goal_cell: GridCoord
+    obstacle_cells: Set[GridCoord]
+    cell_costs: CellCostMap
+    bounds: Tuple[int, int, int, int]
+    path_nodes: List[GridCoord]
+    path_cells: List[GridCoord]
+    path_enu: List[ENU]
+
+
+def _iter_cells_on_segment(start: GridCoord, end: GridCoord) -> Iterable[GridCoord]:
+    x0, y0 = start
+    x1, y1 = end
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+
+    while True:
+        yield (x0, y0)
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = err * 2
+        if e2 > -dy:
+            err -= dy
+            x0 += sx
+        if e2 < dx:
+            err += dx
+            y0 += sy
+
+
+def _expand_path_cells(path_nodes: Sequence[GridCoord]) -> List[GridCoord]:
+    if not path_nodes:
+        return []
+    expanded: List[GridCoord] = [path_nodes[0]]
+    for idx in range(1, len(path_nodes)):
+        for cell in _iter_cells_on_segment(path_nodes[idx - 1], path_nodes[idx]):
+            if expanded[-1] == cell:
+                continue
+            expanded.append(cell)
     return expanded
-
-
-def _build_obstacle_cells(obstacles: Iterable[TrackedObstacle], frame: GridFrame, params: PathFindingParams) -> Set[GridCoord]:
-    obstacle_cells: Set[GridCoord] = set()
-    projection_time_s = max(0.0, float(params.obstacle_projection_time_s))
-    expansion_radius = int(params.obstacle_expansion_radius_cells)
-
-    for obstacle in obstacles:
-        start_cell = frame.enu_to_grid(obstacle.position_enu)
-        projected_cells: Set[GridCoord] = {start_cell}
-        speed = float(obstacle.speed_mps)
-        if projection_time_s > 0.0 and math.isfinite(speed) and speed > 0.0:
-            projected_enu = ENU(
-                east_m=float(obstacle.position_enu.east_m) + float(obstacle.vel_east_mps) * projection_time_s,
-                north_m=float(obstacle.position_enu.north_m) + float(obstacle.vel_north_mps) * projection_time_s,
-            )
-            end_cell = frame.enu_to_grid(projected_enu)
-            for cell in _iter_cells_on_segment(start_cell, end_cell):
-                projected_cells.add(cell)
-
-        obstacle_cells.update(_expand_cells(projected_cells, expansion_radius))
-
-    return obstacle_cells
 
 
 def _extract_obstacles(tracked_world: Iterable[Dict[str, Any]]) -> List[TrackedObstacle]:
@@ -346,87 +427,216 @@ def _extract_obstacles(tracked_world: Iterable[Dict[str, Any]]) -> List[TrackedO
                 vel_east_mps=vel_east_mps,
                 vel_north_mps=vel_north_mps,
                 speed_mps=float(speed_mps),
+                track_id=int(det["track_id"]) if det.get("track_id") is not None else None,
+                source_record=det,
             )
         )
     return obstacles
 
 
-def _search_bounds(start: GridCoord, goal: GridCoord, padding_cells: int) -> Tuple[int, int, int, int]:
-    xs = [start[0], goal[0]]
-    ys = [start[1], goal[1]]
-    return (
-        min(xs) - padding_cells,
-        max(xs) + padding_cells,
-        min(ys) - padding_cells,
-        max(ys) + padding_cells,
-    )
+def _set_track_tcpa_metadata(record: Optional[Dict[str, Any]], tcpa_s: Optional[float]) -> None:
+    if not isinstance(record, dict):
+        return
+    if tcpa_s is None or not math.isfinite(tcpa_s):
+        record["tcpa_s"] = None
+        record["tcpa_is_infinite"] = True
+        return
+    record["tcpa_s"] = max(0.0, float(tcpa_s))
+    record["tcpa_is_infinite"] = False
 
 
-def _in_bounds(cell: GridCoord, bounds: Tuple[int, int, int, int]) -> bool:
-    min_x, max_x, min_y, max_y = bounds
-    return min_x <= cell[0] <= max_x and min_y <= cell[1] <= max_y
+def _compute_tcpa_s(
+    obstacle: TrackedObstacle,
+    *,
+    ego_enu: ENU,
+    ego_vel_east_mps: float,
+    ego_vel_north_mps: float,
+) -> Optional[float]:
+    rel_pos_east = float(ego_enu.east_m) - float(obstacle.position_enu.east_m)
+    rel_pos_north = float(ego_enu.north_m) - float(obstacle.position_enu.north_m)
+    distance_m = math.hypot(rel_pos_east, rel_pos_north)
+    if distance_m <= 1e-6:
+        return 0.0
+
+    unit_rel_east = rel_pos_east / distance_m
+    unit_rel_north = rel_pos_north / distance_m
+    rel_vel_east = float(obstacle.vel_east_mps) - float(ego_vel_east_mps)
+    rel_vel_north = float(obstacle.vel_north_mps) - float(ego_vel_north_mps)
+    closing_speed_mps = rel_vel_east * unit_rel_east + rel_vel_north * unit_rel_north
+    if not math.isfinite(closing_speed_mps) or closing_speed_mps <= 1e-6:
+        return None
+
+    tcpa_s = distance_m / closing_speed_mps
+    if not math.isfinite(tcpa_s) or tcpa_s < 0.0:
+        return None
+    return tcpa_s
 
 
-def _bounds_to_dict(bounds: Tuple[int, int, int, int]) -> Dict[str, int]:
-    min_x, max_x, min_y, max_y = bounds
-    return {
-        "min_x": int(min_x),
-        "max_x": int(max_x),
-        "min_y": int(min_y),
-        "max_y": int(max_y),
-    }
+def _cell_cost(cell_costs: CellCostMap, cell: GridCoord) -> float:
+    value = cell_costs.get(cell, 0.0)
+    if not math.isfinite(value):
+        return 0.0
+    return max(0.0, float(value))
 
 
-@dataclass(frozen=True)
-class AStarGridResult:
-    start_cell: GridCoord
-    goal_cell: GridCoord
-    obstacle_cells: Set[GridCoord]
-    bounds: Tuple[int, int, int, int]
-    path_nodes: List[GridCoord]
-    path_cells: List[GridCoord]
-    path_enu: List[ENU]
+def _add_cell_cost(
+    cell_costs: CellCostMap,
+    cell: GridCoord,
+    amount: float,
+    *,
+    bounds: Optional[Tuple[int, int, int, int]] = None,
+) -> None:
+    if not math.isfinite(amount) or amount <= 0.0:
+        return
+    if bounds is not None and not _in_bounds(cell, bounds):
+        return
+    cell_costs[cell] = _cell_cost(cell_costs, cell) + float(amount)
 
 
-def _iter_cells_on_segment(start: GridCoord, end: GridCoord) -> Iterable[GridCoord]:
-    x0, y0 = start
-    x1, y1 = end
-    dx = abs(x1 - x0)
-    dy = abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx - dy
-
-    while True:
-        yield (x0, y0)
-        if x0 == x1 and y0 == y1:
-            break
-        e2 = err * 2
-        if e2 > -dy:
-            err -= dy
-            x0 += sx
-        if e2 < dx:
-            err += dx
-            y0 += sy
+def _apply_expanded_cost(
+    cell_costs: CellCostMap,
+    center: GridCoord,
+    base_cost: float,
+    *,
+    radius_cells: int,
+    decay: float,
+    bounds: Optional[Tuple[int, int, int, int]] = None,
+) -> None:
+    radius = max(0, int(radius_cells))
+    decay = max(0.0, min(1.0, float(decay)))
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            ring = max(abs(dx), abs(dy))
+            ring_cost = float(base_cost) * (decay**ring)
+            _add_cell_cost(cell_costs, (center[0] + dx, center[1] + dy), ring_cost, bounds=bounds)
 
 
-def _line_of_sight(start: GridCoord, end: GridCoord, obstacle_cells: Set[GridCoord]) -> bool:
-    for cell in _iter_cells_on_segment(start, end):
-        if cell in obstacle_cells and cell != start and cell != end:
-            return False
-    return True
+def _apply_segment_cost_ramp(
+    cell_costs: CellCostMap,
+    *,
+    start: GridCoord,
+    end: GridCoord,
+    start_cost: float,
+    end_cost: float,
+    expansion_radius_cells: int,
+    expansion_decay: float,
+    bounds: Optional[Tuple[int, int, int, int]] = None,
+) -> None:
+    segment_cells = list(_iter_cells_on_segment(start, end))
+    if not segment_cells:
+        return
+    if len(segment_cells) == 1:
+        _apply_expanded_cost(
+            cell_costs,
+            segment_cells[0],
+            max(float(start_cost), float(end_cost)),
+            radius_cells=expansion_radius_cells,
+            decay=expansion_decay,
+            bounds=bounds,
+        )
+        return
+
+    denom = max(1, len(segment_cells) - 1)
+    for idx, cell in enumerate(segment_cells):
+        interp = float(idx) / float(denom)
+        base_cost = float(start_cost) + (float(end_cost) - float(start_cost)) * interp
+        _apply_expanded_cost(
+            cell_costs,
+            cell,
+            base_cost,
+            radius_cells=expansion_radius_cells,
+            decay=expansion_decay,
+            bounds=bounds,
+        )
 
 
-def _expand_path_cells(path_nodes: Sequence[GridCoord]) -> List[GridCoord]:
-    if not path_nodes:
-        return []
-    expanded: List[GridCoord] = [path_nodes[0]]
-    for idx in range(1, len(path_nodes)):
-        for cell in _iter_cells_on_segment(path_nodes[idx - 1], path_nodes[idx]):
-            if expanded[-1] == cell:
-                continue
-            expanded.append(cell)
-    return expanded
+def _annotate_obstacles_tcpa(
+    obstacles: Sequence[TrackedObstacle],
+    *,
+    ego_enu: ENU,
+    ego_vel_east_mps: float,
+    ego_vel_north_mps: float,
+) -> None:
+    for obstacle in obstacles:
+        obstacle.tcpa_s = _compute_tcpa_s(
+            obstacle,
+            ego_enu=ego_enu,
+            ego_vel_east_mps=ego_vel_east_mps,
+            ego_vel_north_mps=ego_vel_north_mps,
+        )
+        _set_track_tcpa_metadata(obstacle.source_record, obstacle.tcpa_s)
+
+
+def _build_cost_field(
+    obstacles: Sequence[TrackedObstacle],
+    *,
+    frame: GridFrame,
+    params: PathFindingParams,
+    bounds: Tuple[int, int, int, int],
+) -> CellCostMap:
+    cell_costs: CellCostMap = {}
+    for obstacle in obstacles:
+        start_cell = frame.enu_to_grid(obstacle.position_enu)
+        if obstacle.tcpa_s is not None and math.isfinite(obstacle.tcpa_s) and obstacle.tcpa_s > 0.0:
+            projected_enu = ENU(
+                east_m=float(obstacle.position_enu.east_m) + float(obstacle.vel_east_mps) * float(obstacle.tcpa_s),
+                north_m=float(obstacle.position_enu.north_m) + float(obstacle.vel_north_mps) * float(obstacle.tcpa_s),
+            )
+            end_cell = frame.enu_to_grid(projected_enu)
+            _apply_segment_cost_ramp(
+                cell_costs,
+                start=start_cell,
+                end=end_cell,
+                start_cost=float(params.track_current_position_cost),
+                end_cost=float(params.track_future_collision_cost),
+                expansion_radius_cells=int(params.track_cost_expansion_radius_cells),
+                expansion_decay=float(params.track_cost_expansion_decay),
+                bounds=bounds,
+            )
+            continue
+
+        _apply_expanded_cost(
+            cell_costs,
+            start_cell,
+            float(params.track_current_position_cost),
+            radius_cells=int(params.track_cost_expansion_radius_cells),
+            decay=float(params.track_cost_expansion_decay),
+            bounds=bounds,
+        )
+    return cell_costs
+
+
+def _segment_step_cost(a: GridCoord, b: GridCoord, cardinal_cost: float, diagonal_cost: float) -> float:
+    dx = abs(a[0] - b[0])
+    dy = abs(a[1] - b[1])
+    if dx == 1 and dy == 1:
+        return diagonal_cost
+    return cardinal_cost
+
+
+def _score_theta_shortcut(
+    *,
+    parent: GridCoord,
+    neighbor: GridCoord,
+    parent_g: float,
+    baseline_cost: float,
+    cell_costs: CellCostMap,
+    cardinal_cost: float,
+    diagonal_cost: float,
+) -> float:
+    running_cost = float(parent_g)
+    prev = parent
+    first = True
+    for cell in _iter_cells_on_segment(parent, neighbor):
+        if first:
+            first = False
+            continue
+        running_cost += _segment_step_cost(prev, cell, cardinal_cost, diagonal_cost)
+        running_cost += _cell_cost(cell_costs, cell)
+        if running_cost >= baseline_cost:
+            return float("inf")
+        prev = cell
+    return running_cost
 
 
 def astar_path(
@@ -434,17 +644,28 @@ def astar_path(
     frame: GridFrame,
     start_enu: ENU,
     goal_enu: ENU,
-    obstacles: Iterable[TrackedObstacle],
+    obstacles: Sequence[TrackedObstacle],
+    ego_enu: ENU,
+    ego_vel_east_mps: float,
+    ego_vel_north_mps: float,
     params: PathFindingParams,
 ) -> AStarGridResult:
     start = frame.enu_to_grid(start_enu)
     goal = frame.enu_to_grid(goal_enu)
-    obstacle_cells = _build_obstacle_cells(obstacles, frame, params)
-    obstacle_cells.discard(start)
-    obstacle_cells.discard(goal)
-
     padding_cells = max(10, int(math.ceil(params.path_distance_m / max(params.grid_size_m, 1e-6) * 0.2)))
     bounds = _search_bounds(start, goal, padding_cells)
+
+    _annotate_obstacles_tcpa(
+        obstacles,
+        ego_enu=ego_enu,
+        ego_vel_east_mps=ego_vel_east_mps,
+        ego_vel_north_mps=ego_vel_north_mps,
+    )
+    debug_cell_costs = _build_cost_field(obstacles, frame=frame, params=params, bounds=bounds)
+    search_cell_costs: CellCostMap = dict(debug_cell_costs)
+    search_cell_costs.pop(start, None)
+    search_cell_costs.pop(goal, None)
+    occupied_cells = {cell for cell, cost in debug_cell_costs.items() if cost > 0.0}
 
     open_heap: List[Tuple[float, int, GridCoord]] = []
     heapq.heappush(open_heap, (0.0, 0, start))
@@ -465,7 +686,8 @@ def astar_path(
             return AStarGridResult(
                 start_cell=start,
                 goal_cell=goal,
-                obstacle_cells=set(obstacle_cells),
+                obstacle_cells=occupied_cells,
+                cell_costs=debug_cell_costs,
                 bounds=bounds,
                 path_nodes=path_nodes,
                 path_cells=path_cells,
@@ -474,34 +696,41 @@ def astar_path(
 
         current_g = g_score.get(current, float("inf"))
         for neighbor, step_cost in _neighbors(current, params.cardinal_cost, params.diagonal_cost):
-            if neighbor in obstacle_cells or not _in_bounds(neighbor, bounds):
+            if not _in_bounds(neighbor, bounds):
                 continue
-            actual_parent = current
-            actual_parent_key = current
-            actual_step_cost = step_cost
+
+            normal_candidate = current_g + step_cost + _cell_cost(search_cell_costs, neighbor)
+            best_parent = current
+            best_cost = normal_candidate
             parent_key = came_from.get(current)
-            if use_theta and parent_key is not None and _line_of_sight(parent_key, neighbor, obstacle_cells):
-                actual_parent = parent_key
-                actual_parent_key = parent_key
-                actual_step_cost = _heuristic(
-                    actual_parent,
-                    neighbor,
-                    params.cardinal_cost,
-                    params.diagonal_cost,
+            if use_theta and parent_key is not None:
+                parent_g = g_score.get(parent_key, float("inf"))
+                shortcut_candidate = _score_theta_shortcut(
+                    parent=parent_key,
+                    neighbor=neighbor,
+                    parent_g=parent_g,
+                    baseline_cost=normal_candidate,
+                    cell_costs=search_cell_costs,
+                    cardinal_cost=float(params.cardinal_cost),
+                    diagonal_cost=float(params.diagonal_cost),
                 )
-            tentative_g = g_score.get(actual_parent_key, float("inf")) + actual_step_cost
-            if tentative_g >= g_score.get(neighbor, float("inf")):
+                if shortcut_candidate < best_cost:
+                    best_parent = parent_key
+                    best_cost = shortcut_candidate
+
+            if best_cost >= g_score.get(neighbor, float("inf")):
                 continue
-            came_from[neighbor] = actual_parent
-            g_score[neighbor] = tentative_g
+            came_from[neighbor] = best_parent
+            g_score[neighbor] = best_cost
             push_count += 1
-            f_score = tentative_g + _heuristic(neighbor, goal, params.cardinal_cost, params.diagonal_cost)
+            f_score = best_cost + _heuristic(neighbor, goal, params.cardinal_cost, params.diagonal_cost)
             heapq.heappush(open_heap, (f_score, push_count, neighbor))
 
     return AStarGridResult(
         start_cell=start,
         goal_cell=goal,
-        obstacle_cells=set(obstacle_cells),
+        obstacle_cells=occupied_cells,
+        cell_costs=debug_cell_costs,
         bounds=bounds,
         path_nodes=[],
         path_cells=[],
@@ -537,14 +766,24 @@ class PathFinderRuntime:
         frame_number: int,
         ego_enu: ENU,
         ego_heading_deg: float,
+        ego_vel_east_mps: float = 0.0,
+        ego_vel_north_mps: float = 0.0,
         tracked_world: Sequence[Dict[str, Any]],
     ) -> Optional[PathFindingResult]:
         async with self._lock:
             params = self._params
+            obstacles = _extract_obstacles(tracked_world)
+            _annotate_obstacles_tcpa(
+                obstacles,
+                ego_enu=ego_enu,
+                ego_vel_east_mps=ego_vel_east_mps,
+                ego_vel_north_mps=ego_vel_north_mps,
+            )
             if not params.enabled:
                 self._last_result = None
                 self._last_run_frame = None
                 return None
+
             should_run = (
                 self._last_result is None
                 or self._last_run_frame is None
@@ -565,6 +804,8 @@ class PathFinderRuntime:
                     start_cell=list(self._last_result.start_cell),
                     goal_cell=list(self._last_result.goal_cell),
                     obstacle_cells=[list(cell) for cell in self._last_result.obstacle_cells],
+                    cost_cells=[list(cell) for cell in self._last_result.cost_cells],
+                    max_cell_cost=float(self._last_result.max_cell_cost),
                     path_cells=[list(cell) for cell in self._last_result.path_cells],
                     obstacle_count=self._last_result.obstacle_count,
                     used_cached_result=True,
@@ -581,16 +822,23 @@ class PathFinderRuntime:
                 north_m=float(ego_enu.north_m) + float(goal_offset.north_m),
             )
 
-            obstacles = _extract_obstacles(tracked_world)
             grid_frame = _build_grid_frame(params=params, ego_enu=ego_enu, ego_heading_deg=float(ego_heading_deg))
             grid_result = astar_path(
                 frame=grid_frame,
                 start_enu=ego_enu,
                 goal_enu=goal_enu,
                 obstacles=obstacles,
+                ego_enu=ego_enu,
+                ego_vel_east_mps=ego_vel_east_mps,
+                ego_vel_north_mps=ego_vel_north_mps,
                 params=params,
             )
             path_points = [{"east_m": float(p.east_m), "north_m": float(p.north_m)} for p in grid_result.path_enu]
+            sorted_cost_cells = sorted(
+                [[int(cell[0]), int(cell[1]), float(cost)] for cell, cost in grid_result.cell_costs.items() if cost > 0.0],
+                key=lambda item: (item[0], item[1]),
+            )
+            max_cell_cost = max((float(item[2]) for item in sorted_cost_cells), default=0.0)
             result = PathFindingResult(
                 frame_number=frame_number,
                 params=params,
@@ -602,6 +850,8 @@ class PathFinderRuntime:
                 start_cell=[int(grid_result.start_cell[0]), int(grid_result.start_cell[1])],
                 goal_cell=[int(grid_result.goal_cell[0]), int(grid_result.goal_cell[1])],
                 obstacle_cells=sorted([[int(cell[0]), int(cell[1])] for cell in grid_result.obstacle_cells]),
+                cost_cells=sorted_cost_cells,
+                max_cell_cost=max_cell_cost,
                 path_cells=[[int(cell[0]), int(cell[1])] for cell in grid_result.path_cells],
                 obstacle_count=len(obstacles),
                 used_cached_result=False,

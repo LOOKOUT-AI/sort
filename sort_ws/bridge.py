@@ -370,6 +370,8 @@ async def _process_video_payload(
                 frame_number=frame_counter[0],
                 ego_enu=ego.enu_from_ref,
                 ego_heading_deg=float(ego.heading_deg),
+                ego_vel_east_mps=float(ego.vel_east_mps or 0.0),
+                ego_vel_north_mps=float(ego.vel_north_mps or 0.0),
                 tracked_world=tracked_world,
             )
             if result is not None:

@@ -46,6 +46,8 @@ class EgoState:
     heading_deg: Optional[float]
     ref_latlon: Optional[LatLon]
     enu_from_ref: Optional[ENU]
+    vel_east_mps: Optional[float] = None
+    vel_north_mps: Optional[float] = None
 
 
 class EgoSmoother:
@@ -146,10 +148,14 @@ class EgoSmoother:
 
         latlon_out: Optional[LatLon] = obs.latlon
         enu_from_ref: Optional[ENU] = None
+        vel_east_mps: Optional[float] = None
+        vel_north_mps: Optional[float] = None
         if self._kf is not None and self._ref is not None:
             east = float(self._kf.x[0, 0])
             north = float(self._kf.x[1, 0])
             enu_from_ref = ENU(east_m=east, north_m=north)
+            vel_east_mps = float(self._kf.x[2, 0])
+            vel_north_mps = float(self._kf.x[3, 0])
 
         return EgoState(
             timestamp=obs.timestamp,
@@ -157,6 +163,8 @@ class EgoSmoother:
             heading_deg=heading_out if heading_out is not None else obs.heading_deg,
             ref_latlon=self._ref,
             enu_from_ref=enu_from_ref,
+            vel_east_mps=vel_east_mps,
+            vel_north_mps=vel_north_mps,
         )
 
 
@@ -166,7 +174,13 @@ class EgoStateStore:
         self._smoother = smoother
         self._latest_obs = EgoObservation()
         self._latest_state = EgoState(
-            timestamp=None, latlon=None, heading_deg=None, ref_latlon=None, enu_from_ref=None
+            timestamp=None,
+            latlon=None,
+            heading_deg=None,
+            ref_latlon=None,
+            enu_from_ref=None,
+            vel_east_mps=None,
+            vel_north_mps=None,
         )
 
     async def update_from_nmea_json(self, msg_text: str) -> None:
