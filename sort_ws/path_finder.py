@@ -65,6 +65,8 @@ class PathFindingParams:
     velocity_arrow_projection_time_s: float = 10.0
     track_current_position_cost: float = 1.0
     track_future_collision_cost: float = 3.0
+    ego_current_position_cost: float = 2.0
+    ego_future_collision_cost: float = 3.0
     track_cost_expansion_radius_cells: int = 2
     track_cost_expansion_decay: float = 0.5
     mode: str = "astar_enu"
@@ -99,6 +101,16 @@ class PathFindingParams:
                 0.0,
                 50.0,
             ),
+            ego_current_position_cost=_clamp(
+                raw.get("ego_current_position_cost", cls.ego_current_position_cost),
+                0.0,
+                20.0,
+            ),
+            ego_future_collision_cost=_clamp(
+                raw.get("ego_future_collision_cost", cls.ego_future_collision_cost),
+                0.0,
+                50.0,
+            ),
             track_cost_expansion_radius_cells=_clamp(
                 raw.get("track_cost_expansion_radius_cells", cls.track_cost_expansion_radius_cells),
                 0,
@@ -126,6 +138,8 @@ class PathFindingParams:
             "velocity_arrow_projection_time_s": float(self.velocity_arrow_projection_time_s),
             "track_current_position_cost": float(self.track_current_position_cost),
             "track_future_collision_cost": float(self.track_future_collision_cost),
+            "ego_current_position_cost": float(self.ego_current_position_cost),
+            "ego_future_collision_cost": float(self.ego_future_collision_cost),
             "track_cost_expansion_radius_cells": int(self.track_cost_expansion_radius_cells),
             "track_cost_expansion_decay": float(self.track_cost_expansion_decay),
             "mode": str(self.mode),
@@ -212,6 +226,8 @@ class PathFindingResult:
     obstacle_cells: List[List[int]]
     cost_cells: List[List[float]]
     max_cell_cost: float
+    future_region_cells: List[List[float]]
+    max_future_region_cost: float
     path_cells: List[List[int]]
     obstacle_count: int
     used_cached_result: bool = False
@@ -246,6 +262,8 @@ class PathFindingResult:
                     "obstacle_cells": [list(cell) for cell in self.obstacle_cells],
                     "cost_cells": [list(cell) for cell in self.cost_cells],
                     "max_cell_cost": float(self.max_cell_cost),
+                    "future_region_cells": [list(cell) for cell in self.future_region_cells],
+                    "max_future_region_cost": float(self.max_future_region_cost),
                     "path_cells": [list(cell) for cell in self.path_cells],
                 }
             )
@@ -345,6 +363,7 @@ class AStarGridResult:
     goal_cell: GridCoord
     obstacle_cells: Set[GridCoord]
     cell_costs: CellCostMap
+    future_region_costs: CellCostMap
     bounds: Tuple[int, int, int, int]
     path_nodes: List[GridCoord]
     path_cells: List[GridCoord]
@@ -550,6 +569,151 @@ def _apply_segment_cost_ramp(
         )
 
 
+def _has_valid_tcpa(tcpa_s: Optional[float]) -> bool:
+    return tcpa_s is not None and math.isfinite(tcpa_s) and tcpa_s > 0.0
+
+
+def _project_enu(enu: ENU, *, vel_east_mps: float, vel_north_mps: float, duration_s: float) -> ENU:
+    return ENU(
+        east_m=float(enu.east_m) + float(vel_east_mps) * float(duration_s),
+        north_m=float(enu.north_m) + float(vel_north_mps) * float(duration_s),
+    )
+
+
+def _build_static_region_costs(
+    *,
+    frame: GridFrame,
+    center_enu: ENU,
+    base_cost: float,
+    expansion_radius_cells: int,
+    expansion_decay: float,
+    bounds: Tuple[int, int, int, int],
+) -> CellCostMap:
+    region_costs: CellCostMap = {}
+    _apply_expanded_cost(
+        region_costs,
+        frame.enu_to_grid(center_enu),
+        float(base_cost),
+        radius_cells=expansion_radius_cells,
+        decay=expansion_decay,
+        bounds=bounds,
+    )
+    return region_costs
+
+
+def _build_motion_region_costs(
+    *,
+    frame: GridFrame,
+    start_enu: ENU,
+    end_enu: ENU,
+    start_cost: float,
+    end_cost: float,
+    expansion_radius_cells: int,
+    expansion_decay: float,
+    bounds: Tuple[int, int, int, int],
+) -> CellCostMap:
+    region_costs: CellCostMap = {}
+    _apply_segment_cost_ramp(
+        region_costs,
+        start=frame.enu_to_grid(start_enu),
+        end=frame.enu_to_grid(end_enu),
+        start_cost=float(start_cost),
+        end_cost=float(end_cost),
+        expansion_radius_cells=expansion_radius_cells,
+        expansion_decay=expansion_decay,
+        bounds=bounds,
+    )
+    return region_costs
+
+
+def _multiply_cell_costs(a: CellCostMap, b: CellCostMap) -> CellCostMap:
+    if not a or not b:
+        return {}
+    shared_cells = a.keys() & b.keys()
+    multiplied: CellCostMap = {}
+    for cell in shared_cells:
+        value = _cell_cost(a, cell) * _cell_cost(b, cell)
+        if value > 0.0 and math.isfinite(value):
+            multiplied[cell] = float(value)
+    return multiplied
+
+
+def _accumulate_cell_costs(
+    target: CellCostMap,
+    source: CellCostMap,
+    *,
+    bounds: Optional[Tuple[int, int, int, int]] = None,
+) -> None:
+    for cell, amount in source.items():
+        _add_cell_cost(target, cell, amount, bounds=bounds)
+
+
+def _build_track_regions_and_overlap(
+    obstacle: TrackedObstacle,
+    *,
+    ego_enu: ENU,
+    ego_vel_east_mps: float,
+    ego_vel_north_mps: float,
+    frame: GridFrame,
+    params: PathFindingParams,
+    bounds: Tuple[int, int, int, int],
+) -> Tuple[CellCostMap, CellCostMap, CellCostMap]:
+    expansion_radius = int(params.track_cost_expansion_radius_cells)
+    expansion_decay = float(params.track_cost_expansion_decay)
+    if _has_valid_tcpa(obstacle.tcpa_s):
+        assert obstacle.tcpa_s is not None
+        horizon_s = float(obstacle.tcpa_s)
+        track_region = _build_motion_region_costs(
+            frame=frame,
+            start_enu=obstacle.position_enu,
+            end_enu=_project_enu(
+                obstacle.position_enu,
+                vel_east_mps=float(obstacle.vel_east_mps),
+                vel_north_mps=float(obstacle.vel_north_mps),
+                duration_s=horizon_s,
+            ),
+            start_cost=float(params.track_current_position_cost),
+            end_cost=float(params.track_future_collision_cost),
+            expansion_radius_cells=expansion_radius,
+            expansion_decay=expansion_decay,
+            bounds=bounds,
+        )
+        ego_region = _build_motion_region_costs(
+            frame=frame,
+            start_enu=ego_enu,
+            end_enu=_project_enu(
+                ego_enu,
+                vel_east_mps=float(ego_vel_east_mps),
+                vel_north_mps=float(ego_vel_north_mps),
+                duration_s=horizon_s,
+            ),
+            start_cost=float(params.ego_current_position_cost),
+            end_cost=float(params.ego_future_collision_cost),
+            expansion_radius_cells=expansion_radius,
+            expansion_decay=expansion_decay,
+            bounds=bounds,
+        )
+        return track_region, ego_region, _multiply_cell_costs(track_region, ego_region)
+
+    track_region = _build_static_region_costs(
+        frame=frame,
+        center_enu=obstacle.position_enu,
+        base_cost=float(params.track_current_position_cost),
+        expansion_radius_cells=expansion_radius,
+        expansion_decay=expansion_decay,
+        bounds=bounds,
+    )
+    ego_region = _build_static_region_costs(
+        frame=frame,
+        center_enu=ego_enu,
+        base_cost=float(params.ego_current_position_cost),
+        expansion_radius_cells=expansion_radius,
+        expansion_decay=expansion_decay,
+        bounds=bounds,
+    )
+    return track_region, ego_region, _multiply_cell_costs(track_region, ego_region)
+
+
 def _annotate_obstacles_tcpa(
     obstacles: Sequence[TrackedObstacle],
     *,
@@ -570,40 +734,29 @@ def _annotate_obstacles_tcpa(
 def _build_cost_field(
     obstacles: Sequence[TrackedObstacle],
     *,
+    ego_enu: ENU,
+    ego_vel_east_mps: float,
+    ego_vel_north_mps: float,
     frame: GridFrame,
     params: PathFindingParams,
     bounds: Tuple[int, int, int, int],
-) -> CellCostMap:
+) -> Tuple[CellCostMap, CellCostMap]:
     cell_costs: CellCostMap = {}
+    future_region_costs: CellCostMap = {}
     for obstacle in obstacles:
-        start_cell = frame.enu_to_grid(obstacle.position_enu)
-        if obstacle.tcpa_s is not None and math.isfinite(obstacle.tcpa_s) and obstacle.tcpa_s > 0.0:
-            projected_enu = ENU(
-                east_m=float(obstacle.position_enu.east_m) + float(obstacle.vel_east_mps) * float(obstacle.tcpa_s),
-                north_m=float(obstacle.position_enu.north_m) + float(obstacle.vel_north_mps) * float(obstacle.tcpa_s),
-            )
-            end_cell = frame.enu_to_grid(projected_enu)
-            _apply_segment_cost_ramp(
-                cell_costs,
-                start=start_cell,
-                end=end_cell,
-                start_cost=float(params.track_current_position_cost),
-                end_cost=float(params.track_future_collision_cost),
-                expansion_radius_cells=int(params.track_cost_expansion_radius_cells),
-                expansion_decay=float(params.track_cost_expansion_decay),
-                bounds=bounds,
-            )
-            continue
-
-        _apply_expanded_cost(
-            cell_costs,
-            start_cell,
-            float(params.track_current_position_cost),
-            radius_cells=int(params.track_cost_expansion_radius_cells),
-            decay=float(params.track_cost_expansion_decay),
+        track_region, ego_region, overlap_costs = _build_track_regions_and_overlap(
+            obstacle,
+            ego_enu=ego_enu,
+            ego_vel_east_mps=ego_vel_east_mps,
+            ego_vel_north_mps=ego_vel_north_mps,
+            frame=frame,
+            params=params,
             bounds=bounds,
         )
-    return cell_costs
+        _accumulate_cell_costs(future_region_costs, track_region, bounds=bounds)
+        _accumulate_cell_costs(future_region_costs, ego_region, bounds=bounds)
+        _accumulate_cell_costs(cell_costs, overlap_costs, bounds=bounds)
+    return cell_costs, future_region_costs
 
 
 def _segment_step_cost(a: GridCoord, b: GridCoord, cardinal_cost: float, diagonal_cost: float) -> float:
@@ -661,7 +814,15 @@ def astar_path(
         ego_vel_east_mps=ego_vel_east_mps,
         ego_vel_north_mps=ego_vel_north_mps,
     )
-    debug_cell_costs = _build_cost_field(obstacles, frame=frame, params=params, bounds=bounds)
+    debug_cell_costs, debug_future_region_costs = _build_cost_field(
+        obstacles,
+        ego_enu=ego_enu,
+        ego_vel_east_mps=ego_vel_east_mps,
+        ego_vel_north_mps=ego_vel_north_mps,
+        frame=frame,
+        params=params,
+        bounds=bounds,
+    )
     search_cell_costs: CellCostMap = dict(debug_cell_costs)
     search_cell_costs.pop(start, None)
     search_cell_costs.pop(goal, None)
@@ -688,6 +849,7 @@ def astar_path(
                 goal_cell=goal,
                 obstacle_cells=occupied_cells,
                 cell_costs=debug_cell_costs,
+                future_region_costs=debug_future_region_costs,
                 bounds=bounds,
                 path_nodes=path_nodes,
                 path_cells=path_cells,
@@ -731,6 +893,7 @@ def astar_path(
         goal_cell=goal,
         obstacle_cells=occupied_cells,
         cell_costs=debug_cell_costs,
+        future_region_costs=debug_future_region_costs,
         bounds=bounds,
         path_nodes=[],
         path_cells=[],
@@ -806,6 +969,8 @@ class PathFinderRuntime:
                     obstacle_cells=[list(cell) for cell in self._last_result.obstacle_cells],
                     cost_cells=[list(cell) for cell in self._last_result.cost_cells],
                     max_cell_cost=float(self._last_result.max_cell_cost),
+                    future_region_cells=[list(cell) for cell in self._last_result.future_region_cells],
+                    max_future_region_cost=float(self._last_result.max_future_region_cost),
                     path_cells=[list(cell) for cell in self._last_result.path_cells],
                     obstacle_count=self._last_result.obstacle_count,
                     used_cached_result=True,
@@ -839,6 +1004,15 @@ class PathFinderRuntime:
                 key=lambda item: (item[0], item[1]),
             )
             max_cell_cost = max((float(item[2]) for item in sorted_cost_cells), default=0.0)
+            sorted_future_region_cells = sorted(
+                [
+                    [int(cell[0]), int(cell[1]), float(cost)]
+                    for cell, cost in grid_result.future_region_costs.items()
+                    if cost > 0.0
+                ],
+                key=lambda item: (item[0], item[1]),
+            )
+            max_future_region_cost = max((float(item[2]) for item in sorted_future_region_cells), default=0.0)
             result = PathFindingResult(
                 frame_number=frame_number,
                 params=params,
@@ -852,6 +1026,8 @@ class PathFinderRuntime:
                 obstacle_cells=sorted([[int(cell[0]), int(cell[1])] for cell in grid_result.obstacle_cells]),
                 cost_cells=sorted_cost_cells,
                 max_cell_cost=max_cell_cost,
+                future_region_cells=sorted_future_region_cells,
+                max_future_region_cost=max_future_region_cost,
                 path_cells=[[int(cell[0]), int(cell[1])] for cell in grid_result.path_cells],
                 obstacle_count=len(obstacles),
                 used_cached_result=False,
