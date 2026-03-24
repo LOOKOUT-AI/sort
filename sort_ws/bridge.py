@@ -17,7 +17,7 @@ from .ego import EgoSmoother, EgoStateStore
 from .image_space_tracker import ImageSpaceSort
 from .world_space_tracker import WorldSpaceSort
 from .image_to_world import detection_to_world_latlon, enu_to_latlon, latlon_to_enu_m, ENU
-from .path_finder import PathFinderRuntime
+from .path_planner import PathPlannerRuntime
 from .world_to_image import world_to_image_space
 
 
@@ -337,7 +337,7 @@ async def _process_video_payload(
     image_tracker: ImageSpaceSort,
     world_tracker: Optional[WorldSpaceSort],
     ego_store: Optional[EgoStateStore],
-    path_finder: Optional[PathFinderRuntime],
+    path_planner: Optional[PathPlannerRuntime],
     video_hub: BroadcastHub,
     frame_counter: List[int],
     source_label: str = "upstream",
@@ -362,11 +362,11 @@ async def _process_video_payload(
             cfg=cfg,
         )
 
-    path_finding_payload: Optional[Dict[str, Any]] = None
-    if path_finder is not None and ego_store is not None:
+    path_planning_payload: Optional[Dict[str, Any]] = None
+    if path_planner is not None and ego_store is not None:
         ego = await ego_store.get()
         if ego.heading_deg is not None and ego.enu_from_ref is not None and ego.ref_latlon is not None:
-            result = await path_finder.compute(
+            result = await path_planner.compute(
                 frame_number=frame_counter[0],
                 ego_enu=ego.enu_from_ref,
                 ego_heading_deg=float(ego.heading_deg),
@@ -375,7 +375,7 @@ async def _process_video_payload(
                 tracked_world=tracked_world,
             )
             if result is not None:
-                path_finding_payload = result.to_payload(
+                path_planning_payload = result.to_payload(
                     enu_ref_lat=float(ego.ref_latlon.lat),
                     enu_ref_lon=float(ego.ref_latlon.lon),
                 )
@@ -394,10 +394,10 @@ async def _process_video_payload(
 
     vm.metadata["bboxes"] = tracked_bboxes
     vm.metadata["tracked"] = True
-    if path_finding_payload is not None:
-        vm.metadata["path_finding"] = path_finding_payload
+    if path_planning_payload is not None:
+        vm.metadata["path_planning"] = path_planning_payload
     else:
-        vm.metadata.pop("path_finding", None)
+        vm.metadata.pop("path_planning", None)
     out_payload = encode_video_message(vm.metadata, vm.jpeg_bytes)
     await video_hub.broadcast(out_payload)
 
@@ -427,7 +427,7 @@ async def _upstream_video_loop(
     image_tracker: ImageSpaceSort,
     world_tracker: Optional[WorldSpaceSort],
     ego_store: Optional[EgoStateStore],
-    path_finder: Optional[PathFinderRuntime],
+    path_planner: Optional[PathPlannerRuntime],
     video_hub: BroadcastHub,
 ) -> None:
     url = _ws_url(cfg.upstream_host, cfg.upstream_video_port)
@@ -446,7 +446,7 @@ async def _upstream_video_loop(
                         image_tracker=image_tracker,
                         world_tracker=world_tracker,
                         ego_store=ego_store,
-                        path_finder=path_finder,
+                        path_planner=path_planner,
                         video_hub=video_hub,
                         frame_counter=frame_counter,
                         source_label="upstream",
@@ -541,7 +541,7 @@ async def _downstream_control_handler(
     mode_state: TrackingModeState,
     playback_cache: PlaybackInfoCache,
     world_tracker: Optional[WorldSpaceSort] = None,
-    path_finder: Optional[PathFinderRuntime] = None,
+    path_planner: Optional[PathPlannerRuntime] = None,
 ) -> None:
     await control_hub.register(ws)
     try:
@@ -567,8 +567,8 @@ async def _downstream_control_handler(
             pass
 
         try:
-            if path_finder is not None:
-                await ws.send(json.dumps({"path_finding_params": await path_finder.get_params()}))
+            if path_planner is not None:
+                await ws.send(json.dumps({"path_planning_params": await path_planner.get_params()}))
         except Exception:
             pass
 
@@ -628,19 +628,19 @@ async def _downstream_control_handler(
                         except Exception:
                             pass
                     continue
-                if cmd == "get_path_finding_params":
-                    if path_finder is not None:
+                if cmd == "get_path_planning_params":
+                    if path_planner is not None:
                         try:
-                            await ws.send(json.dumps({"path_finding_params": await path_finder.get_params()}))
+                            await ws.send(json.dumps({"path_planning_params": await path_planner.get_params()}))
                         except Exception:
                             pass
                     continue
-                if cmd == "set_path_finding_params":
-                    if path_finder is not None:
+                if cmd == "set_path_planning_params":
+                    if path_planner is not None:
                         new_params = {k: v for k, v in obj.items() if k not in ("command", "cmd")}
-                        updated = await path_finder.set_params(new_params)
+                        updated = await path_planner.set_params(new_params)
                         try:
-                            await ws.send(json.dumps({"ack": "set_path_finding_params", "path_finding_params": updated}))
+                            await ws.send(json.dumps({"ack": "set_path_planning_params", "path_planning_params": updated}))
                         except Exception:
                             pass
                     continue
@@ -658,7 +658,7 @@ async def _sim_video_handler(
     image_tracker: ImageSpaceSort,
     world_tracker: Optional[WorldSpaceSort],
     ego_store: Optional[EgoStateStore],
-    path_finder: Optional[PathFinderRuntime],
+    path_planner: Optional[PathPlannerRuntime],
     video_hub: BroadcastHub,
 ) -> None:
     """Accept video+bbox messages from the frontend simulator."""
@@ -675,7 +675,7 @@ async def _sim_video_handler(
                 image_tracker=image_tracker,
                 world_tracker=world_tracker,
                 ego_store=ego_store,
-                path_finder=path_finder,
+                path_planner=path_planner,
                 video_hub=video_hub,
                 frame_counter=frame_counter,
                 source_label="sim",
@@ -719,7 +719,7 @@ async def run_bridge(
     outbound_to_upstream: asyncio.Queue[str] = asyncio.Queue()
     mode_state = TrackingModeState(cfg.mode)
     playback_cache = PlaybackInfoCache()
-    path_finder = PathFinderRuntime()
+    path_planner = PathPlannerRuntime()
 
     # Start downstream servers and keep the returned server objects alive.
     video_server = await websockets.serve(
@@ -742,7 +742,7 @@ async def run_bridge(
             mode_state,
             playback_cache,
             world_tracker,
-            path_finder,
+            path_planner,
         ),
         cfg.downstream_bind,
         cfg.downstream_control_port,
@@ -760,7 +760,7 @@ async def run_bridge(
                 image_tracker=image_tracker,
                 world_tracker=world_tracker,
                 ego_store=ego_store,
-                path_finder=path_finder,
+                path_planner=path_planner,
                 video_hub=video_hub,
             ),
             cfg.downstream_bind,
@@ -793,7 +793,7 @@ async def run_bridge(
 
     try:
         await asyncio.gather(
-            _upstream_video_loop(cfg, mode_state, image_tracker, world_tracker, ego_store, path_finder, video_hub),
+            _upstream_video_loop(cfg, mode_state, image_tracker, world_tracker, ego_store, path_planner, video_hub),
             _upstream_nmea_loop(cfg, nmea_hub, ego_store),
             _upstream_control_loop(cfg, control_hub, outbound_to_upstream, playback_cache),
         )

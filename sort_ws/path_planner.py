@@ -11,7 +11,7 @@ from .image_to_world import ENU, right_fwd_to_enu_m
 
 GridCoord = Tuple[int, int]
 CellCostMap = Dict[GridCoord, float]
-PATH_FINDING_MODES = (
+PATH_PLANNING_MODES = (
     "astar_enu",
     "astar_ego_relative",
     "theta_enu",
@@ -45,7 +45,7 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 
 def _coerce_mode(value: Any, default: str) -> str:
     mode = str(value or default).strip().lower()
-    return mode if mode in PATH_FINDING_MODES else default
+    return mode if mode in PATH_PLANNING_MODES else default
 
 
 def _coerce_velocity_arrow_mode(value: Any, default: str) -> str:
@@ -54,7 +54,7 @@ def _coerce_velocity_arrow_mode(value: Any, default: str) -> str:
 
 
 @dataclass(frozen=True)
-class PathFindingParams:
+class PathPlanningParams:
     enabled: bool = True
     path_distance_m: float = 1000.0
     grid_size_m: float = 5.0
@@ -73,7 +73,7 @@ class PathFindingParams:
     show_debug_grid: bool = True
 
     @classmethod
-    def from_mapping(cls, values: Optional[Dict[str, Any]] = None) -> "PathFindingParams":
+    def from_mapping(cls, values: Optional[Dict[str, Any]] = None) -> "PathPlanningParams":
         raw = values or {}
         return cls(
             enabled=_coerce_bool(raw.get("enabled", cls.enabled), cls.enabled),
@@ -213,9 +213,9 @@ class GridFrame:
 
 
 @dataclass(frozen=True)
-class PathFindingResult:
+class PathPlanningResult:
     frame_number: int
-    params: PathFindingParams
+    params: PathPlanningParams
     start_enu: ENU
     goal_enu: ENU
     path_enu_points: List[Dict[str, float]]
@@ -277,7 +277,7 @@ def _normalize_enu_basis(east_m: float, north_m: float) -> Tuple[float, float]:
     return (float(east_m) / mag, float(north_m) / mag)
 
 
-def _build_grid_frame(*, params: PathFindingParams, ego_enu: ENU, ego_heading_deg: float) -> GridFrame:
+def _build_grid_frame(*, params: PathPlanningParams, ego_enu: ENU, ego_heading_deg: float) -> GridFrame:
     mode = str(params.mode)
     if mode in {"astar_ego_relative", "theta_ego_relative"}:
         starboard = right_fwd_to_enu_m(right_m=1.0, forward_m=0.0, heading_deg=float(ego_heading_deg))
@@ -655,7 +655,7 @@ def _build_track_regions_and_overlap(
     ego_vel_east_mps: float,
     ego_vel_north_mps: float,
     frame: GridFrame,
-    params: PathFindingParams,
+    params: PathPlanningParams,
     bounds: Tuple[int, int, int, int],
 ) -> Tuple[CellCostMap, CellCostMap, CellCostMap]:
     expansion_radius = int(params.track_cost_expansion_radius_cells)
@@ -738,7 +738,7 @@ def _build_cost_field(
     ego_vel_east_mps: float,
     ego_vel_north_mps: float,
     frame: GridFrame,
-    params: PathFindingParams,
+    params: PathPlanningParams,
     bounds: Tuple[int, int, int, int],
 ) -> Tuple[CellCostMap, CellCostMap]:
     cell_costs: CellCostMap = {}
@@ -801,7 +801,7 @@ def astar_path(
     ego_enu: ENU,
     ego_vel_east_mps: float,
     ego_vel_north_mps: float,
-    params: PathFindingParams,
+    params: PathPlanningParams,
 ) -> AStarGridResult:
     start = frame.enu_to_grid(start_enu)
     goal = frame.enu_to_grid(goal_enu)
@@ -901,11 +901,11 @@ def astar_path(
     )
 
 
-class PathFinderRuntime:
+class PathPlannerRuntime:
     def __init__(self, initial_params: Optional[Dict[str, Any]] = None):
         self._lock = asyncio.Lock()
-        self._params = PathFindingParams.from_mapping(initial_params)
-        self._last_result: Optional[PathFindingResult] = None
+        self._params = PathPlanningParams.from_mapping(initial_params)
+        self._last_result: Optional[PathPlanningResult] = None
         self._last_run_frame: Optional[int] = None
 
     async def get_params(self) -> Dict[str, Any]:
@@ -918,7 +918,7 @@ class PathFinderRuntime:
             for key, value in (new_values or {}).items():
                 if key in merged:
                     merged[key] = value
-            self._params = PathFindingParams.from_mapping(merged)
+            self._params = PathPlanningParams.from_mapping(merged)
             self._last_result = None
             self._last_run_frame = None
             return self._params.to_dict()
@@ -932,7 +932,7 @@ class PathFinderRuntime:
         ego_vel_east_mps: float = 0.0,
         ego_vel_north_mps: float = 0.0,
         tracked_world: Sequence[Dict[str, Any]],
-    ) -> Optional[PathFindingResult]:
+    ) -> Optional[PathPlanningResult]:
         async with self._lock:
             params = self._params
             obstacles = _extract_obstacles(tracked_world)
@@ -956,7 +956,7 @@ class PathFinderRuntime:
             if not should_run:
                 if self._last_result is None:
                     return None
-                return PathFindingResult(
+                return PathPlanningResult(
                     frame_number=frame_number,
                     params=self._last_result.params,
                     start_enu=self._last_result.start_enu,
@@ -1013,7 +1013,7 @@ class PathFinderRuntime:
                 key=lambda item: (item[0], item[1]),
             )
             max_future_region_cost = max((float(item[2]) for item in sorted_future_region_cells), default=0.0)
-            result = PathFindingResult(
+            result = PathPlanningResult(
                 frame_number=frame_number,
                 params=params,
                 start_enu=ego_enu,
