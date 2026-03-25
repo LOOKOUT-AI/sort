@@ -4,7 +4,7 @@ import asyncio
 import heapq
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .image_to_world import ENU, LatLon, latlon_to_enu_m, right_fwd_to_enu_m
@@ -20,6 +20,11 @@ PATH_PLANNING_MODES = (
 )
 VELOCITY_ARROW_PROJECTION_MODES = ("tcpa", "manual")
 DEFAULT_EGO_OBSTACLE_HALF_ANGLE_DEG = 55.3 / 2.0
+DEFAULT_COLREG_DANGER_RADIUS_M = 300.0
+DEFAULT_COLREG_ANGLE_MIN_DEG = -90.0
+DEFAULT_COLREG_ANGLE_MAX_DEG = 90.0
+EGO_OBSTACLE_MARKER_COST = -1.0
+COLREG_ZONE_MARKER_COST = -2.0
 
 
 def _clamp(value: Any, lo: float, hi: float, *, integer: bool = False):
@@ -98,6 +103,12 @@ class PathPlanningParams:
     ego_obstacle_radius_m: float = 150.0
     ego_obstacle_angle_min_deg: float = -DEFAULT_EGO_OBSTACLE_HALF_ANGLE_DEG
     ego_obstacle_angle_max_deg: float = DEFAULT_EGO_OBSTACLE_HALF_ANGLE_DEG
+    colreg_enabled: bool = True
+    colreg_danger_radius_m: float = DEFAULT_COLREG_DANGER_RADIUS_M
+    colreg_danger_angle_min_deg: float = DEFAULT_COLREG_ANGLE_MIN_DEG
+    colreg_danger_angle_max_deg: float = DEFAULT_COLREG_ANGLE_MAX_DEG
+    port_side_cost_decay: float = 0.1
+    colreg_collision_goal_forward_m: float = 5.0
     mode: str = "astar_enu"
     show_debug_grid: bool = True
 
@@ -109,6 +120,12 @@ class PathPlanningParams:
             raw.get("ego_obstacle_angle_max_deg", cls.ego_obstacle_angle_max_deg),
             default_min=cls.ego_obstacle_angle_min_deg,
             default_max=cls.ego_obstacle_angle_max_deg,
+        )
+        colreg_danger_angle_min_deg, colreg_danger_angle_max_deg = _coerce_angle_range(
+            raw.get("colreg_danger_angle_min_deg", cls.colreg_danger_angle_min_deg),
+            raw.get("colreg_danger_angle_max_deg", cls.colreg_danger_angle_max_deg),
+            default_min=cls.colreg_danger_angle_min_deg,
+            default_max=cls.colreg_danger_angle_max_deg,
         )
         return cls(
             enabled=_coerce_bool(raw.get("enabled", cls.enabled), cls.enabled),
@@ -186,6 +203,16 @@ class PathPlanningParams:
             ),
             ego_obstacle_angle_min_deg=ego_obstacle_angle_min_deg,
             ego_obstacle_angle_max_deg=ego_obstacle_angle_max_deg,
+            colreg_enabled=_coerce_bool(raw.get("colreg_enabled", cls.colreg_enabled), cls.colreg_enabled),
+            colreg_danger_radius_m=_clamp(raw.get("colreg_danger_radius_m", cls.colreg_danger_radius_m), 100.0, 300.0),
+            colreg_danger_angle_min_deg=colreg_danger_angle_min_deg,
+            colreg_danger_angle_max_deg=colreg_danger_angle_max_deg,
+            port_side_cost_decay=_clamp(raw.get("port_side_cost_decay", cls.port_side_cost_decay), 0.0, 1.0),
+            colreg_collision_goal_forward_m=_clamp(
+                raw.get("colreg_collision_goal_forward_m", cls.colreg_collision_goal_forward_m),
+                1.0,
+                100.0,
+            ),
             mode=_coerce_mode(raw.get("mode", cls.mode), cls.mode),
             show_debug_grid=_coerce_bool(raw.get("show_debug_grid", cls.show_debug_grid), cls.show_debug_grid),
         )
@@ -215,6 +242,12 @@ class PathPlanningParams:
             "ego_obstacle_radius_m": float(self.ego_obstacle_radius_m),
             "ego_obstacle_angle_min_deg": float(self.ego_obstacle_angle_min_deg),
             "ego_obstacle_angle_max_deg": float(self.ego_obstacle_angle_max_deg),
+            "colreg_enabled": bool(self.colreg_enabled),
+            "colreg_danger_radius_m": float(self.colreg_danger_radius_m),
+            "colreg_danger_angle_min_deg": float(self.colreg_danger_angle_min_deg),
+            "colreg_danger_angle_max_deg": float(self.colreg_danger_angle_max_deg),
+            "port_side_cost_decay": float(self.port_side_cost_decay),
+            "colreg_collision_goal_forward_m": float(self.colreg_collision_goal_forward_m),
             "mode": str(self.mode),
             "show_debug_grid": bool(self.show_debug_grid),
         }
@@ -290,11 +323,15 @@ class PathPlanningResult:
     frame_number: int
     params: PathPlanningParams
     start_enu: ENU
+    display_goal_enu: ENU
+    active_goal_enu: ENU
     goal_enu: ENU
     path_enu_points: List[Dict[str, float]]
     grid_frame: Dict[str, Any]
     grid_bounds: Dict[str, int]
     start_cell: List[int]
+    display_goal_cell: List[int]
+    active_goal_cell: List[int]
     goal_cell: List[int]
     obstacle_cells: List[List[int]]
     cost_cells: List[List[float]]
@@ -319,6 +356,14 @@ class PathPlanningResult:
                 "east_m": float(self.start_enu.east_m),
                 "north_m": float(self.start_enu.north_m),
             },
+            "display_goal_enu": {
+                "east_m": float(self.display_goal_enu.east_m),
+                "north_m": float(self.display_goal_enu.north_m),
+            },
+            "active_goal_enu": {
+                "east_m": float(self.active_goal_enu.east_m),
+                "north_m": float(self.active_goal_enu.north_m),
+            },
             "goal_enu": {
                 "east_m": float(self.goal_enu.east_m),
                 "north_m": float(self.goal_enu.north_m),
@@ -334,6 +379,8 @@ class PathPlanningResult:
                     "grid_frame": dict(self.grid_frame),
                     "grid_bounds": dict(self.grid_bounds),
                     "start_cell": list(self.start_cell),
+                    "display_goal_cell": list(self.display_goal_cell),
+                    "active_goal_cell": list(self.active_goal_cell),
                     "goal_cell": list(self.goal_cell),
                     "obstacle_cells": [list(cell) for cell in self.obstacle_cells],
                     "cost_cells": [list(cell) for cell in self.cost_cells],
@@ -507,9 +554,12 @@ def _bounds_to_dict(bounds: Tuple[int, int, int, int]) -> Dict[str, int]:
 @dataclass(frozen=True)
 class AStarGridResult:
     start_cell: GridCoord
+    display_goal_cell: GridCoord
+    active_goal_cell: GridCoord
     goal_cell: GridCoord
     obstacle_cells: Set[GridCoord]
     ego_obstacle_cells: Set[GridCoord]
+    colreg_zone_cells: Set[GridCoord]
     cell_costs: CellCostMap
     future_region_costs: CellCostMap
     route_costs: CellCostMap
@@ -650,7 +700,7 @@ def _build_route_attraction_costs(
 
 
 @dataclass(frozen=True)
-class EgoObstacleMaskCacheKey:
+class SectorMaskCacheKey:
     grid_size_m: float
     radius_m: float
     angle_min_deg: float
@@ -658,9 +708,16 @@ class EgoObstacleMaskCacheKey:
 
 
 @dataclass(frozen=True)
-class EgoObstacleMaskCache:
-    key: EgoObstacleMaskCacheKey
+class SectorMaskCache:
+    key: SectorMaskCacheKey
     local_cells: Tuple[GridCoord, ...]
+
+
+@dataclass
+class ColregEvaluation:
+    starboard_track_entered: bool = False
+    starboard_presence_cells: Set[GridCoord] = field(default_factory=set)
+    collision_cells: Set[GridCoord] = field(default_factory=set)
 
 
 def _angle_in_range(angle_deg: float, angle_min_deg: float, angle_max_deg: float) -> bool:
@@ -670,7 +727,7 @@ def _angle_in_range(angle_deg: float, angle_min_deg: float, angle_max_deg: float
     return float(angle_min_deg) - epsilon <= float(angle_deg) <= float(angle_max_deg) + epsilon
 
 
-def _build_local_ego_obstacle_cells(
+def _build_local_sector_cells(
     *,
     grid_size_m: float,
     radius_m: float,
@@ -695,7 +752,22 @@ def _build_local_ego_obstacle_cells(
     return tuple(sorted(set(local_cells)))
 
 
-def _project_local_ego_obstacle_cells(
+def _build_local_ego_obstacle_cells(
+    *,
+    grid_size_m: float,
+    radius_m: float,
+    angle_min_deg: float,
+    angle_max_deg: float,
+) -> Tuple[GridCoord, ...]:
+    return _build_local_sector_cells(
+        grid_size_m=grid_size_m,
+        radius_m=radius_m,
+        angle_min_deg=angle_min_deg,
+        angle_max_deg=angle_max_deg,
+    )
+
+
+def _project_local_sector_cells(
     *,
     local_cells: Sequence[GridCoord],
     frame: GridFrame,
@@ -730,6 +802,16 @@ def _project_local_ego_obstacle_cells(
     return projected_cells
 
 
+def _project_local_ego_obstacle_cells(
+    *,
+    local_cells: Sequence[GridCoord],
+    frame: GridFrame,
+    ego_enu: ENU,
+    bounds: Tuple[int, int, int, int],
+) -> Set[GridCoord]:
+    return _project_local_sector_cells(local_cells=local_cells, frame=frame, ego_enu=ego_enu, bounds=bounds)
+
+
 def _track_region_overlaps_ego_obstacle(track_region: CellCostMap, ego_obstacle_cells: Set[GridCoord]) -> bool:
     if not track_region or not ego_obstacle_cells:
         return False
@@ -742,6 +824,51 @@ def _track_region_overlaps_ego_obstacle(track_region: CellCostMap, ego_obstacle_
         if cell in track_region:
             return True
     return False
+
+
+def _cell_costs_in_mask(cell_costs: CellCostMap, mask_cells: Set[GridCoord]) -> Set[GridCoord]:
+    if not cell_costs or not mask_cells:
+        return set()
+    if len(cell_costs) <= len(mask_cells):
+        return {cell for cell in cell_costs.keys() if cell in mask_cells}
+    return {cell for cell in mask_cells if cell in cell_costs}
+
+
+def _relative_bearing_deg(*, ego_enu: ENU, target_enu: ENU, heading_deg: float) -> float:
+    starboard = right_fwd_to_enu_m(right_m=1.0, forward_m=0.0, heading_deg=float(heading_deg))
+    forward = right_fwd_to_enu_m(right_m=0.0, forward_m=1.0, heading_deg=float(heading_deg))
+    starboard_unit = _normalize_enu_basis(starboard.east_m, starboard.north_m)
+    forward_unit = _normalize_enu_basis(forward.east_m, forward.north_m)
+    delta_east = float(target_enu.east_m) - float(ego_enu.east_m)
+    delta_north = float(target_enu.north_m) - float(ego_enu.north_m)
+    right_m = delta_east * starboard_unit[0] + delta_north * starboard_unit[1]
+    forward_m = delta_east * forward_unit[0] + delta_north * forward_unit[1]
+    if abs(right_m) <= 1e-6 and abs(forward_m) <= 1e-6:
+        return 0.0
+    return math.degrees(math.atan2(right_m, forward_m))
+
+
+def _classify_colreg_side(*, ego_enu: ENU, target_enu: ENU, heading_deg: float) -> str:
+    bearing_deg = _relative_bearing_deg(ego_enu=ego_enu, target_enu=target_enu, heading_deg=heading_deg)
+    if bearing_deg > 1e-6:
+        return "starboard"
+    if bearing_deg < -1e-6:
+        return "port"
+    return "ahead"
+
+
+def _scale_cell_costs(cell_costs: CellCostMap, factor: float) -> CellCostMap:
+    safe_factor = max(0.0, float(factor))
+    if safe_factor >= 1.0:
+        return dict(cell_costs)
+    if safe_factor <= 0.0:
+        return {}
+    scaled: CellCostMap = {}
+    for cell, cost in cell_costs.items():
+        scaled_cost = float(cost) * safe_factor
+        if scaled_cost > 0.0 and math.isfinite(scaled_cost):
+            scaled[cell] = scaled_cost
+    return scaled
 
 
 def _extract_obstacles(tracked_world: Iterable[Dict[str, Any]]) -> List[TrackedObstacle]:
@@ -988,6 +1115,89 @@ def _accumulate_cell_costs(
         _add_cell_cost(target, cell, amount, bounds=bounds)
 
 
+def _build_forward_goal_cell(
+    *,
+    frame: GridFrame,
+    ego_enu: ENU,
+    ego_heading_deg: float,
+    forward_cells: int,
+) -> GridCoord:
+    forward_distance_m = max(0, int(forward_cells)) * float(frame.grid_size_m)
+    offset = right_fwd_to_enu_m(right_m=0.0, forward_m=forward_distance_m, heading_deg=float(ego_heading_deg))
+    return frame.enu_to_grid(
+        ENU(
+            east_m=float(ego_enu.east_m) + float(offset.east_m),
+            north_m=float(ego_enu.north_m) + float(offset.north_m),
+        )
+    )
+
+
+def _shortest_grid_distance_to_target(
+    *,
+    seed_cells: Set[GridCoord],
+    target_cell: GridCoord,
+    bounds: Tuple[int, int, int, int],
+) -> Optional[int]:
+    if target_cell in seed_cells:
+        return 0
+    if not seed_cells:
+        return None
+    visited: Set[GridCoord] = set(seed_cells)
+    frontier: deque[Tuple[GridCoord, int]] = deque((cell, 0) for cell in seed_cells if _in_bounds(cell, bounds))
+    while frontier:
+        cell, distance = frontier.popleft()
+        for neighbor in _iter_grid_neighbors_8(cell):
+            if not _in_bounds(neighbor, bounds) or neighbor in visited:
+                continue
+            next_distance = distance + 1
+            if neighbor == target_cell:
+                return next_distance
+            visited.add(neighbor)
+            frontier.append((neighbor, next_distance))
+    return None
+
+
+def _resolve_colreg_active_goal_cell(
+    *,
+    frame: GridFrame,
+    ego_enu: ENU,
+    ego_heading_deg: float,
+    start_cell: GridCoord,
+    display_goal_cell: GridCoord,
+    bounds: Tuple[int, int, int, int],
+    blocked_cells: Set[GridCoord],
+    collision_cells: Set[GridCoord],
+    starboard_presence_cells: Set[GridCoord],
+    collision_goal_forward_m: float,
+) -> GridCoord:
+    if not starboard_presence_cells:
+        return display_goal_cell
+    if collision_cells:
+        desired_steps = max(1, int(math.ceil(max(float(collision_goal_forward_m), 0.0) / max(float(frame.grid_size_m), 1e-6))))
+    else:
+        distance = _shortest_grid_distance_to_target(
+            seed_cells=starboard_presence_cells,
+            target_cell=start_cell,
+            bounds=bounds,
+        )
+        if distance is None:
+            return display_goal_cell
+        desired_steps = max(1, int(math.floor(float(distance) / 2.0)))
+    for forward_cells in range(desired_steps, 0, -1):
+        candidate = _build_forward_goal_cell(
+            frame=frame,
+            ego_enu=ego_enu,
+            ego_heading_deg=ego_heading_deg,
+            forward_cells=forward_cells,
+        )
+        if not _in_bounds(candidate, bounds):
+            continue
+        if candidate in blocked_cells or candidate in collision_cells:
+            continue
+        return candidate
+    return display_goal_cell
+
+
 def _build_track_regions_and_overlap(
     obstacle: TrackedObstacle,
     *,
@@ -1075,16 +1285,19 @@ def _build_cost_field(
     obstacles: Sequence[TrackedObstacle],
     *,
     ego_enu: ENU,
+    ego_heading_deg: float,
     ego_vel_east_mps: float,
     ego_vel_north_mps: float,
     frame: GridFrame,
     params: PathPlanningParams,
     bounds: Tuple[int, int, int, int],
     ego_obstacle_cells: Set[GridCoord],
-) -> Tuple[CellCostMap, CellCostMap, bool]:
+    colreg_zone_cells: Set[GridCoord],
+) -> Tuple[CellCostMap, CellCostMap, bool, ColregEvaluation]:
     cell_costs: CellCostMap = {}
     future_region_costs: CellCostMap = {}
     ego_obstacle_active = False
+    colreg_evaluation = ColregEvaluation()
     for obstacle in obstacles:
         track_region, ego_region, overlap_costs = _build_track_regions_and_overlap(
             obstacle,
@@ -1095,12 +1308,27 @@ def _build_cost_field(
             params=params,
             bounds=bounds,
         )
+        track_side = _classify_colreg_side(
+            ego_enu=ego_enu,
+            target_enu=obstacle.position_enu,
+            heading_deg=ego_heading_deg,
+        )
+        track_zone_cells = _cell_costs_in_mask(track_region, colreg_zone_cells)
+        entered_colreg_zone = bool(track_zone_cells)
+        if entered_colreg_zone and params.colreg_enabled and track_side == "port":
+            track_region = _scale_cell_costs(track_region, float(params.port_side_cost_decay))
+            overlap_costs = _multiply_cell_costs(track_region, ego_region)
+            track_zone_cells = _cell_costs_in_mask(track_region, colreg_zone_cells)
         if not ego_obstacle_active and _track_region_overlaps_ego_obstacle(track_region, ego_obstacle_cells):
             ego_obstacle_active = True
+        if entered_colreg_zone and params.colreg_enabled and track_side == "starboard":
+            colreg_evaluation.starboard_track_entered = True
+            colreg_evaluation.starboard_presence_cells.update(track_zone_cells)
+            colreg_evaluation.collision_cells.update(_cell_costs_in_mask(overlap_costs, colreg_zone_cells))
         _accumulate_cell_costs(future_region_costs, track_region, bounds=bounds)
         _accumulate_cell_costs(future_region_costs, ego_region, bounds=bounds)
         _accumulate_cell_costs(cell_costs, overlap_costs, bounds=bounds)
-    return cell_costs, future_region_costs, ego_obstacle_active
+    return cell_costs, future_region_costs, ego_obstacle_active, colreg_evaluation
 
 
 def _segment_step_cost(a: GridCoord, b: GridCoord, cardinal_cost: float, diagonal_cost: float) -> float:
@@ -1143,51 +1371,67 @@ def astar_path(
     *,
     frame: GridFrame,
     start_enu: ENU,
-    goal_enu: ENU,
+    display_goal_enu: ENU,
     route_points_enu: Sequence[ENU],
     obstacles: Sequence[TrackedObstacle],
     ego_enu: ENU,
+    ego_heading_deg: float,
     ego_vel_east_mps: float,
     ego_vel_north_mps: float,
     params: PathPlanningParams,
     ego_obstacle_local_cells: Sequence[GridCoord] = (),
+    colreg_danger_local_cells: Sequence[GridCoord] = (),
 ) -> AStarGridResult:
     start = frame.enu_to_grid(start_enu)
-    goal = frame.enu_to_grid(goal_enu)
+    display_goal = frame.enu_to_grid(display_goal_enu)
     padding_cells = max(10, int(math.ceil(params.path_distance_m / max(params.grid_size_m, 1e-6) * 0.2)))
-    bounds = _search_bounds(start, goal, padding_cells)
-    projected_ego_obstacle_cells = _project_local_ego_obstacle_cells(
+    bounds = _search_bounds(start, display_goal, padding_cells)
+    projected_ego_obstacle_cells = _project_local_sector_cells(
         local_cells=ego_obstacle_local_cells,
         frame=frame,
         ego_enu=ego_enu,
         bounds=bounds,
     )
-
-    _annotate_obstacles_tcpa(
-        obstacles,
+    projected_colreg_zone_cells = _project_local_sector_cells(
+        local_cells=colreg_danger_local_cells,
+        frame=frame,
         ego_enu=ego_enu,
-        ego_vel_east_mps=ego_vel_east_mps,
-        ego_vel_north_mps=ego_vel_north_mps,
+        bounds=bounds,
     )
-    debug_cell_costs, debug_future_region_costs, ego_obstacle_active = _build_cost_field(
+
+    debug_cell_costs, debug_future_region_costs, ego_obstacle_active, colreg_evaluation = _build_cost_field(
         obstacles,
         ego_enu=ego_enu,
+        ego_heading_deg=ego_heading_deg,
         ego_vel_east_mps=ego_vel_east_mps,
         ego_vel_north_mps=ego_vel_north_mps,
         frame=frame,
         params=params,
         bounds=bounds,
         ego_obstacle_cells=projected_ego_obstacle_cells,
+        colreg_zone_cells=projected_colreg_zone_cells,
     )
     route_cells = _build_route_grid_cells(route_points_enu=route_points_enu, frame=frame, bounds=bounds)
     debug_route_costs = _build_route_attraction_costs(route_cells=route_cells, bounds=bounds, params=params)
+    active_goal = _resolve_colreg_active_goal_cell(
+        frame=frame,
+        ego_enu=ego_enu,
+        ego_heading_deg=ego_heading_deg,
+        start_cell=start,
+        display_goal_cell=display_goal,
+        bounds=bounds,
+        blocked_cells=set(projected_ego_obstacle_cells) if ego_obstacle_active else set(),
+        collision_cells=set(colreg_evaluation.collision_cells),
+        starboard_presence_cells=set(colreg_evaluation.starboard_presence_cells),
+        collision_goal_forward_m=float(params.colreg_collision_goal_forward_m),
+    )
     search_cell_costs: CellCostMap = dict(debug_cell_costs)
     _accumulate_cell_costs(search_cell_costs, debug_route_costs, bounds=bounds)
     search_cell_costs.pop(start, None)
-    search_cell_costs.pop(goal, None)
+    search_cell_costs.pop(active_goal, None)
     ego_obstacle_cells = set(projected_ego_obstacle_cells) if ego_obstacle_active else set()
     ego_obstacle_cells.discard(start)
-    ego_obstacle_cells.discard(goal)
+    ego_obstacle_cells.discard(active_goal)
     occupied_cells = {cell for cell, cost in debug_cell_costs.items() if cost > 0.0}
 
     open_heap: List[Tuple[float, int, GridCoord]] = []
@@ -1203,14 +1447,17 @@ def astar_path(
         if current in visited:
             continue
         visited.add(current)
-        if current == goal:
+        if current == active_goal:
             path_nodes = _reconstruct_path(came_from, current)
             path_cells = _expand_path_cells(path_nodes)
             return AStarGridResult(
                 start_cell=start,
-                goal_cell=goal,
+                display_goal_cell=display_goal,
+                active_goal_cell=active_goal,
+                goal_cell=active_goal,
                 obstacle_cells=occupied_cells,
                 ego_obstacle_cells=ego_obstacle_cells,
+                colreg_zone_cells=projected_colreg_zone_cells,
                 cell_costs=debug_cell_costs,
                 future_region_costs=debug_future_region_costs,
                 route_costs=debug_route_costs,
@@ -1253,14 +1500,17 @@ def astar_path(
             came_from[neighbor] = best_parent
             g_score[neighbor] = best_cost
             push_count += 1
-            f_score = best_cost + _heuristic(neighbor, goal, params.cardinal_cost, params.diagonal_cost)
+            f_score = best_cost + _heuristic(neighbor, active_goal, params.cardinal_cost, params.diagonal_cost)
             heapq.heappush(open_heap, (f_score, push_count, neighbor))
 
     return AStarGridResult(
         start_cell=start,
-        goal_cell=goal,
+        display_goal_cell=display_goal,
+        active_goal_cell=active_goal,
+        goal_cell=active_goal,
         obstacle_cells=occupied_cells,
         ego_obstacle_cells=ego_obstacle_cells,
+        colreg_zone_cells=projected_colreg_zone_cells,
         cell_costs=debug_cell_costs,
         future_region_costs=debug_future_region_costs,
         route_costs=debug_route_costs,
@@ -1279,27 +1529,55 @@ class PathPlannerRuntime:
         self._last_result: Optional[PathPlanningResult] = None
         self._last_run_frame: Optional[int] = None
         self._route_points_latlon: List[LatLon] = []
-        self._ego_obstacle_mask_cache: Optional[EgoObstacleMaskCache] = None
+        self._ego_obstacle_mask_cache: Optional[SectorMaskCache] = None
+        self._colreg_danger_mask_cache: Optional[SectorMaskCache] = None
 
-    def _get_ego_obstacle_mask_cache(self, params: PathPlanningParams) -> EgoObstacleMaskCache:
-        key = EgoObstacleMaskCacheKey(
-            grid_size_m=float(params.grid_size_m),
-            radius_m=float(params.ego_obstacle_radius_m),
-            angle_min_deg=float(params.ego_obstacle_angle_min_deg),
-            angle_max_deg=float(params.ego_obstacle_angle_max_deg),
+    def _get_sector_mask_cache(
+        self,
+        cache: Optional[SectorMaskCache],
+        *,
+        grid_size_m: float,
+        radius_m: float,
+        angle_min_deg: float,
+        angle_max_deg: float,
+    ) -> SectorMaskCache:
+        key = SectorMaskCacheKey(
+            grid_size_m=float(grid_size_m),
+            radius_m=float(radius_m),
+            angle_min_deg=float(angle_min_deg),
+            angle_max_deg=float(angle_max_deg),
         )
-        if self._ego_obstacle_mask_cache is not None and self._ego_obstacle_mask_cache.key == key:
-            return self._ego_obstacle_mask_cache
-        self._ego_obstacle_mask_cache = EgoObstacleMaskCache(
+        if cache is not None and cache.key == key:
+            return cache
+        return SectorMaskCache(
             key=key,
-            local_cells=_build_local_ego_obstacle_cells(
+            local_cells=_build_local_sector_cells(
                 grid_size_m=key.grid_size_m,
                 radius_m=key.radius_m,
                 angle_min_deg=key.angle_min_deg,
                 angle_max_deg=key.angle_max_deg,
             ),
         )
+
+    def _get_ego_obstacle_mask_cache(self, params: PathPlanningParams) -> SectorMaskCache:
+        self._ego_obstacle_mask_cache = self._get_sector_mask_cache(
+            self._ego_obstacle_mask_cache,
+            grid_size_m=float(params.grid_size_m),
+            radius_m=float(params.ego_obstacle_radius_m),
+            angle_min_deg=float(params.ego_obstacle_angle_min_deg),
+            angle_max_deg=float(params.ego_obstacle_angle_max_deg),
+        )
         return self._ego_obstacle_mask_cache
+
+    def _get_colreg_danger_mask_cache(self, params: PathPlanningParams) -> SectorMaskCache:
+        self._colreg_danger_mask_cache = self._get_sector_mask_cache(
+            self._colreg_danger_mask_cache,
+            grid_size_m=float(params.grid_size_m),
+            radius_m=float(params.colreg_danger_radius_m),
+            angle_min_deg=float(params.colreg_danger_angle_min_deg),
+            angle_max_deg=float(params.colreg_danger_angle_max_deg),
+        )
+        return self._colreg_danger_mask_cache
 
     async def get_params(self) -> Dict[str, Any]:
         async with self._lock:
@@ -1361,11 +1639,15 @@ class PathPlannerRuntime:
                     frame_number=frame_number,
                     params=self._last_result.params,
                     start_enu=self._last_result.start_enu,
+                    display_goal_enu=self._last_result.display_goal_enu,
+                    active_goal_enu=self._last_result.active_goal_enu,
                     goal_enu=self._last_result.goal_enu,
                     path_enu_points=list(self._last_result.path_enu_points),
                     grid_frame=dict(self._last_result.grid_frame),
                     grid_bounds=dict(self._last_result.grid_bounds),
                     start_cell=list(self._last_result.start_cell),
+                    display_goal_cell=list(self._last_result.display_goal_cell),
+                    active_goal_cell=list(self._last_result.active_goal_cell),
                     goal_cell=list(self._last_result.goal_cell),
                     obstacle_cells=[list(cell) for cell in self._last_result.obstacle_cells],
                     cost_cells=[list(cell) for cell in self._last_result.cost_cells],
@@ -1386,30 +1668,33 @@ class PathPlannerRuntime:
                 forward_m=float(params.path_distance_m),
                 heading_deg=float(ego_heading_deg),
             )
-            goal_enu = ENU(
+            display_goal_enu = ENU(
                 east_m=float(ego_enu.east_m) + float(goal_offset.east_m),
                 north_m=float(ego_enu.north_m) + float(goal_offset.north_m),
             )
             route_points_enu = _route_latlon_points_to_enu(self._route_points_latlon, ego_ref_latlon)
-            goal_enu = _resolve_route_goal_enu(
-                default_goal_enu=goal_enu,
+            display_goal_enu = _resolve_route_goal_enu(
+                default_goal_enu=display_goal_enu,
                 route_points_enu=route_points_enu,
                 params=params,
             )
 
             grid_frame = _build_grid_frame(params=params, ego_enu=ego_enu, ego_heading_deg=float(ego_heading_deg))
             ego_obstacle_mask_cache = self._get_ego_obstacle_mask_cache(params)
+            colreg_danger_mask_cache = self._get_colreg_danger_mask_cache(params)
             grid_result = astar_path(
                 frame=grid_frame,
                 start_enu=ego_enu,
-                goal_enu=goal_enu,
+                display_goal_enu=display_goal_enu,
                 route_points_enu=route_points_enu,
                 obstacles=obstacles,
                 ego_enu=ego_enu,
+                ego_heading_deg=float(ego_heading_deg),
                 ego_vel_east_mps=ego_vel_east_mps,
                 ego_vel_north_mps=ego_vel_north_mps,
                 params=params,
                 ego_obstacle_local_cells=ego_obstacle_mask_cache.local_cells,
+                colreg_danger_local_cells=colreg_danger_mask_cache.local_cells,
             )
             path_points = [{"east_m": float(p.east_m), "north_m": float(p.north_m)} for p in grid_result.path_enu]
             sorted_cost_cells = sorted(
@@ -1418,7 +1703,8 @@ class PathPlannerRuntime:
                     for cell, cost in grid_result.cell_costs.items()
                     if cost > 0.0 and cell not in grid_result.ego_obstacle_cells
                 ]
-                + [[int(cell[0]), int(cell[1]), -1.0] for cell in grid_result.ego_obstacle_cells],
+                + [[int(cell[0]), int(cell[1]), EGO_OBSTACLE_MARKER_COST] for cell in grid_result.ego_obstacle_cells]
+                + [[int(cell[0]), int(cell[1]), COLREG_ZONE_MARKER_COST] for cell in grid_result.colreg_zone_cells],
                 key=lambda item: (item[0], item[1], item[2]),
             )
             max_cell_cost = max((float(item[2]) for item in sorted_cost_cells if float(item[2]) > 0.0), default=0.0)
@@ -1445,11 +1731,15 @@ class PathPlannerRuntime:
                 frame_number=frame_number,
                 params=params,
                 start_enu=ego_enu,
-                goal_enu=goal_enu,
+                display_goal_enu=grid_frame.grid_to_enu(grid_result.display_goal_cell),
+                active_goal_enu=grid_frame.grid_to_enu(grid_result.active_goal_cell),
+                goal_enu=grid_frame.grid_to_enu(grid_result.goal_cell),
                 path_enu_points=path_points,
                 grid_frame=grid_frame.to_payload(),
                 grid_bounds=_bounds_to_dict(grid_result.bounds),
                 start_cell=[int(grid_result.start_cell[0]), int(grid_result.start_cell[1])],
+                display_goal_cell=[int(grid_result.display_goal_cell[0]), int(grid_result.display_goal_cell[1])],
+                active_goal_cell=[int(grid_result.active_goal_cell[0]), int(grid_result.active_goal_cell[1])],
                 goal_cell=[int(grid_result.goal_cell[0]), int(grid_result.goal_cell[1])],
                 obstacle_cells=sorted([[int(cell[0]), int(cell[1])] for cell in grid_result.obstacle_cells]),
                 cost_cells=sorted_cost_cells,
