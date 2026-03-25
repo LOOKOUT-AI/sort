@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import heapq
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from .image_to_world import ENU, right_fwd_to_enu_m
+from .image_to_world import ENU, LatLon, latlon_to_enu_m, right_fwd_to_enu_m
 
 
 GridCoord = Tuple[int, int]
@@ -57,6 +58,12 @@ def _coerce_velocity_arrow_mode(value: Any, default: str) -> str:
 class PathPlanningParams:
     enabled: bool = True
     path_distance_m: float = 1000.0
+    use_route_goal: bool = True
+    route_goal_radius_m: float = 500.0
+    route_attraction_enabled: bool = True
+    route_attraction_corridor_radius_cells: int = 1
+    route_attraction_cost_per_cell: float = 0.2
+    route_attraction_max_cost: float = 2.0
     grid_size_m: float = 5.0
     cardinal_cost: float = 1.0
     diagonal_cost: float = 1.4
@@ -78,6 +85,28 @@ class PathPlanningParams:
         return cls(
             enabled=_coerce_bool(raw.get("enabled", cls.enabled), cls.enabled),
             path_distance_m=_clamp(raw.get("path_distance_m", cls.path_distance_m), 500.0, 1500.0),
+            use_route_goal=_coerce_bool(raw.get("use_route_goal", cls.use_route_goal), cls.use_route_goal),
+            route_goal_radius_m=_clamp(raw.get("route_goal_radius_m", cls.route_goal_radius_m), 0.0, 5000.0),
+            route_attraction_enabled=_coerce_bool(
+                raw.get("route_attraction_enabled", cls.route_attraction_enabled),
+                cls.route_attraction_enabled,
+            ),
+            route_attraction_corridor_radius_cells=_clamp(
+                raw.get("route_attraction_corridor_radius_cells", cls.route_attraction_corridor_radius_cells),
+                1,
+                3,
+                integer=True,
+            ),
+            route_attraction_cost_per_cell=_clamp(
+                raw.get("route_attraction_cost_per_cell", cls.route_attraction_cost_per_cell),
+                0.0,
+                10.0,
+            ),
+            route_attraction_max_cost=_clamp(
+                raw.get("route_attraction_max_cost", cls.route_attraction_max_cost),
+                0.0,
+                20.0,
+            ),
             grid_size_m=_clamp(raw.get("grid_size_m", cls.grid_size_m), 1.0, 20.0),
             cardinal_cost=_clamp(raw.get("cardinal_cost", cls.cardinal_cost), 0.1, 20.0),
             diagonal_cost=_clamp(raw.get("diagonal_cost", cls.diagonal_cost), 0.1, 30.0),
@@ -130,6 +159,12 @@ class PathPlanningParams:
         return {
             "enabled": bool(self.enabled),
             "path_distance_m": float(self.path_distance_m),
+            "use_route_goal": bool(self.use_route_goal),
+            "route_goal_radius_m": float(self.route_goal_radius_m),
+            "route_attraction_enabled": bool(self.route_attraction_enabled),
+            "route_attraction_corridor_radius_cells": int(self.route_attraction_corridor_radius_cells),
+            "route_attraction_cost_per_cell": float(self.route_attraction_cost_per_cell),
+            "route_attraction_max_cost": float(self.route_attraction_max_cost),
             "grid_size_m": float(self.grid_size_m),
             "cardinal_cost": float(self.cardinal_cost),
             "diagonal_cost": float(self.diagonal_cost),
@@ -228,6 +263,9 @@ class PathPlanningResult:
     max_cell_cost: float
     future_region_cells: List[List[float]]
     max_future_region_cost: float
+    route_cells: List[List[int]]
+    route_cost_cells: List[List[float]]
+    max_route_attraction_cost: float
     path_cells: List[List[int]]
     obstacle_count: int
     used_cached_result: bool = False
@@ -264,6 +302,9 @@ class PathPlanningResult:
                     "max_cell_cost": float(self.max_cell_cost),
                     "future_region_cells": [list(cell) for cell in self.future_region_cells],
                     "max_future_region_cost": float(self.max_future_region_cost),
+                    "route_cells": [list(cell) for cell in self.route_cells],
+                    "route_cost_cells": [list(cell) for cell in self.route_cost_cells],
+                    "max_route_attraction_cost": float(self.max_route_attraction_cost),
                     "path_cells": [list(cell) for cell in self.path_cells],
                 }
             )
@@ -275,6 +316,74 @@ def _normalize_enu_basis(east_m: float, north_m: float) -> Tuple[float, float]:
     if mag <= 1e-6:
         return (1.0, 0.0)
     return (float(east_m) / mag, float(north_m) / mag)
+
+
+def _parse_route_latlon_points(values: Optional[Iterable[Any]]) -> List[LatLon]:
+    route_points: List[LatLon] = []
+    for value in values or []:
+        lat_value: Any = None
+        lon_value: Any = None
+        if isinstance(value, dict):
+            lat_value = value.get("lat")
+            lon_value = value.get("lon")
+        elif isinstance(value, (list, tuple)) and len(value) >= 2:
+            lon_value = value[0]
+            lat_value = value[1]
+        try:
+            lat = float(lat_value)
+            lon = float(lon_value)
+        except Exception:
+            continue
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            continue
+        route_points.append(LatLon(lat=lat, lon=lon))
+    return route_points
+
+
+def _route_latlon_points_to_enu(route_points: Sequence[LatLon], ref_latlon: Optional[LatLon]) -> List[ENU]:
+    if ref_latlon is None:
+        return []
+    return [latlon_to_enu_m(ref_latlon, point) for point in route_points]
+
+
+def _find_closest_route_point_within_radius(
+    *,
+    route_points_enu: Sequence[ENU],
+    goal_enu: ENU,
+    radius_m: float,
+) -> Optional[ENU]:
+    radius_sq = max(float(radius_m), 0.0) ** 2
+    best_point: Optional[ENU] = None
+    best_distance_sq = float("inf")
+    for point in route_points_enu:
+        delta_east = float(point.east_m) - float(goal_enu.east_m)
+        delta_north = float(point.north_m) - float(goal_enu.north_m)
+        distance_sq = delta_east * delta_east + delta_north * delta_north
+        if distance_sq > radius_sq:
+            continue
+        if distance_sq >= best_distance_sq:
+            continue
+        best_distance_sq = distance_sq
+        best_point = point
+    return best_point
+
+
+def _resolve_route_goal_enu(
+    *,
+    default_goal_enu: ENU,
+    route_points_enu: Sequence[ENU],
+    params: PathPlanningParams,
+) -> ENU:
+    if not params.use_route_goal:
+        return default_goal_enu
+    if not route_points_enu:
+        return default_goal_enu
+    route_goal = _find_closest_route_point_within_radius(
+        route_points_enu=route_points_enu,
+        goal_enu=default_goal_enu,
+        radius_m=float(params.route_goal_radius_m),
+    )
+    return route_goal if route_goal is not None else default_goal_enu
 
 
 def _build_grid_frame(*, params: PathPlanningParams, ego_enu: ENU, ego_heading_deg: float) -> GridFrame:
@@ -364,7 +473,9 @@ class AStarGridResult:
     obstacle_cells: Set[GridCoord]
     cell_costs: CellCostMap
     future_region_costs: CellCostMap
+    route_costs: CellCostMap
     bounds: Tuple[int, int, int, int]
+    route_cells: Set[GridCoord]
     path_nodes: List[GridCoord]
     path_cells: List[GridCoord]
     path_enu: List[ENU]
@@ -402,6 +513,101 @@ def _expand_path_cells(path_nodes: Sequence[GridCoord]) -> List[GridCoord]:
                 continue
             expanded.append(cell)
     return expanded
+
+
+def _build_route_grid_cells(
+    *,
+    route_points_enu: Sequence[ENU],
+    frame: GridFrame,
+    bounds: Tuple[int, int, int, int],
+) -> Set[GridCoord]:
+    if not route_points_enu:
+        return set()
+    route_nodes = [frame.enu_to_grid(point) for point in route_points_enu]
+    route_cells = _expand_path_cells(route_nodes)
+    return {cell for cell in route_cells if _in_bounds(cell, bounds)}
+
+
+def _iter_grid_neighbors_8(cell: GridCoord) -> Sequence[GridCoord]:
+    x, y = cell
+    return (
+        (x - 1, y - 1),
+        (x, y - 1),
+        (x + 1, y - 1),
+        (x - 1, y),
+        (x + 1, y),
+        (x - 1, y + 1),
+        (x, y + 1),
+        (x + 1, y + 1),
+    )
+
+
+def _build_route_corridor_cells(
+    *,
+    route_cells: Set[GridCoord],
+    bounds: Tuple[int, int, int, int],
+    corridor_radius_cells: int,
+) -> Set[GridCoord]:
+    if not route_cells:
+        return set()
+    radius = max(0, int(corridor_radius_cells))
+    corridor_cells: Set[GridCoord] = set(route_cells)
+    frontier: deque[Tuple[GridCoord, int]] = deque((cell, 0) for cell in route_cells)
+    while frontier:
+        cell, distance = frontier.popleft()
+        if distance >= radius:
+            continue
+        for neighbor in _iter_grid_neighbors_8(cell):
+            if not _in_bounds(neighbor, bounds) or neighbor in corridor_cells:
+                continue
+            corridor_cells.add(neighbor)
+            frontier.append((neighbor, distance + 1))
+    return corridor_cells
+
+
+def _build_route_attraction_costs(
+    *,
+    route_cells: Set[GridCoord],
+    bounds: Tuple[int, int, int, int],
+    params: PathPlanningParams,
+) -> CellCostMap:
+    if not route_cells or not params.route_attraction_enabled:
+        return {}
+    per_layer_cost = float(params.route_attraction_cost_per_cell)
+    max_cost = float(params.route_attraction_max_cost)
+    if per_layer_cost <= 0.0 or max_cost <= 0.0:
+        return {}
+    corridor_cells = _build_route_corridor_cells(
+        route_cells=route_cells,
+        bounds=bounds,
+        corridor_radius_cells=int(params.route_attraction_corridor_radius_cells),
+    )
+    min_x, max_x, min_y, max_y = bounds
+    route_costs: CellCostMap = {}
+    visited: Set[GridCoord] = set(corridor_cells)
+    saturation_layer = max(1, int(math.ceil(max_cost / per_layer_cost)))
+    frontier: deque[Tuple[GridCoord, int]] = deque((cell, 0) for cell in corridor_cells)
+    while frontier:
+        cell, distance = frontier.popleft()
+        if distance >= saturation_layer:
+            continue
+        for neighbor in _iter_grid_neighbors_8(cell):
+            if not _in_bounds(neighbor, bounds) or neighbor in visited:
+                continue
+            next_distance = distance + 1
+            visited.add(neighbor)
+            penalty = min(max_cost, next_distance * per_layer_cost)
+            if penalty > 0.0:
+                route_costs[neighbor] = penalty
+            if penalty < max_cost:
+                frontier.append((neighbor, next_distance))
+    for x in range(min_x, max_x + 1):
+        for y in range(min_y, max_y + 1):
+            cell = (x, y)
+            if cell in visited:
+                continue
+            route_costs[cell] = max_cost
+    return route_costs
 
 
 def _extract_obstacles(tracked_world: Iterable[Dict[str, Any]]) -> List[TrackedObstacle]:
@@ -797,6 +1003,7 @@ def astar_path(
     frame: GridFrame,
     start_enu: ENU,
     goal_enu: ENU,
+    route_points_enu: Sequence[ENU],
     obstacles: Sequence[TrackedObstacle],
     ego_enu: ENU,
     ego_vel_east_mps: float,
@@ -823,7 +1030,10 @@ def astar_path(
         params=params,
         bounds=bounds,
     )
+    route_cells = _build_route_grid_cells(route_points_enu=route_points_enu, frame=frame, bounds=bounds)
+    debug_route_costs = _build_route_attraction_costs(route_cells=route_cells, bounds=bounds, params=params)
     search_cell_costs: CellCostMap = dict(debug_cell_costs)
+    _accumulate_cell_costs(search_cell_costs, debug_route_costs, bounds=bounds)
     search_cell_costs.pop(start, None)
     search_cell_costs.pop(goal, None)
     occupied_cells = {cell for cell, cost in debug_cell_costs.items() if cost > 0.0}
@@ -850,7 +1060,9 @@ def astar_path(
                 obstacle_cells=occupied_cells,
                 cell_costs=debug_cell_costs,
                 future_region_costs=debug_future_region_costs,
+                route_costs=debug_route_costs,
                 bounds=bounds,
+                route_cells=route_cells,
                 path_nodes=path_nodes,
                 path_cells=path_cells,
                 path_enu=[frame.grid_to_enu(cell) for cell in path_nodes],
@@ -894,7 +1106,9 @@ def astar_path(
         obstacle_cells=occupied_cells,
         cell_costs=debug_cell_costs,
         future_region_costs=debug_future_region_costs,
+        route_costs=debug_route_costs,
         bounds=bounds,
+        route_cells=route_cells,
         path_nodes=[],
         path_cells=[],
         path_enu=[],
@@ -907,6 +1121,7 @@ class PathPlannerRuntime:
         self._params = PathPlanningParams.from_mapping(initial_params)
         self._last_result: Optional[PathPlanningResult] = None
         self._last_run_frame: Optional[int] = None
+        self._route_points_latlon: List[LatLon] = []
 
     async def get_params(self) -> Dict[str, Any]:
         async with self._lock:
@@ -923,11 +1138,19 @@ class PathPlannerRuntime:
             self._last_run_frame = None
             return self._params.to_dict()
 
+    async def set_route_points(self, route_points: Optional[Iterable[Any]]) -> Dict[str, Any]:
+        async with self._lock:
+            self._route_points_latlon = _parse_route_latlon_points(route_points)
+            self._last_result = None
+            self._last_run_frame = None
+            return {"route_point_count": len(self._route_points_latlon)}
+
     async def compute(
         self,
         *,
         frame_number: int,
         ego_enu: ENU,
+        ego_ref_latlon: Optional[LatLon],
         ego_heading_deg: float,
         ego_vel_east_mps: float = 0.0,
         ego_vel_north_mps: float = 0.0,
@@ -971,6 +1194,9 @@ class PathPlannerRuntime:
                     max_cell_cost=float(self._last_result.max_cell_cost),
                     future_region_cells=[list(cell) for cell in self._last_result.future_region_cells],
                     max_future_region_cost=float(self._last_result.max_future_region_cost),
+                    route_cells=[list(cell) for cell in self._last_result.route_cells],
+                    route_cost_cells=[list(cell) for cell in self._last_result.route_cost_cells],
+                    max_route_attraction_cost=float(self._last_result.max_route_attraction_cost),
                     path_cells=[list(cell) for cell in self._last_result.path_cells],
                     obstacle_count=self._last_result.obstacle_count,
                     used_cached_result=True,
@@ -986,12 +1212,19 @@ class PathPlannerRuntime:
                 east_m=float(ego_enu.east_m) + float(goal_offset.east_m),
                 north_m=float(ego_enu.north_m) + float(goal_offset.north_m),
             )
+            route_points_enu = _route_latlon_points_to_enu(self._route_points_latlon, ego_ref_latlon)
+            goal_enu = _resolve_route_goal_enu(
+                default_goal_enu=goal_enu,
+                route_points_enu=route_points_enu,
+                params=params,
+            )
 
             grid_frame = _build_grid_frame(params=params, ego_enu=ego_enu, ego_heading_deg=float(ego_heading_deg))
             grid_result = astar_path(
                 frame=grid_frame,
                 start_enu=ego_enu,
                 goal_enu=goal_enu,
+                route_points_enu=route_points_enu,
                 obstacles=obstacles,
                 ego_enu=ego_enu,
                 ego_vel_east_mps=ego_vel_east_mps,
@@ -1013,6 +1246,16 @@ class PathPlannerRuntime:
                 key=lambda item: (item[0], item[1]),
             )
             max_future_region_cost = max((float(item[2]) for item in sorted_future_region_cells), default=0.0)
+            sorted_route_cells = sorted([[int(cell[0]), int(cell[1])] for cell in grid_result.route_cells])
+            sorted_route_cost_cells = sorted(
+                [
+                    [int(cell[0]), int(cell[1]), float(cost)]
+                    for cell, cost in grid_result.route_costs.items()
+                    if cost > 0.0
+                ],
+                key=lambda item: (item[0], item[1]),
+            )
+            max_route_attraction_cost = max((float(item[2]) for item in sorted_route_cost_cells), default=0.0)
             result = PathPlanningResult(
                 frame_number=frame_number,
                 params=params,
@@ -1028,6 +1271,9 @@ class PathPlannerRuntime:
                 max_cell_cost=max_cell_cost,
                 future_region_cells=sorted_future_region_cells,
                 max_future_region_cost=max_future_region_cost,
+                route_cells=sorted_route_cells,
+                route_cost_cells=sorted_route_cost_cells,
+                max_route_attraction_cost=max_route_attraction_cost,
                 path_cells=[[int(cell[0]), int(cell[1])] for cell in grid_result.path_cells],
                 obstacle_count=len(obstacles),
                 used_cached_result=False,

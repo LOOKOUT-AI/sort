@@ -369,6 +369,7 @@ async def _process_video_payload(
             result = await path_planner.compute(
                 frame_number=frame_counter[0],
                 ego_enu=ego.enu_from_ref,
+                ego_ref_latlon=ego.ref_latlon,
                 ego_heading_deg=float(ego.heading_deg),
                 ego_vel_east_mps=float(ego.vel_east_mps or 0.0),
                 ego_vel_north_mps=float(ego.vel_north_mps or 0.0),
@@ -641,6 +642,14 @@ async def _downstream_control_handler(
                         updated = await path_planner.set_params(new_params)
                         try:
                             await ws.send(json.dumps({"ack": "set_path_planning_params", "path_planning_params": updated}))
+                        except Exception:
+                            pass
+                    continue
+                if cmd == "set_path_planning_route":
+                    if path_planner is not None:
+                        updated = await path_planner.set_route_points(obj.get("route_points"))
+                        try:
+                            await ws.send(json.dumps({"ack": "set_path_planning_route", **updated}))
                         except Exception:
                             pass
                     continue
