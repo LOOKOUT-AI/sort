@@ -343,6 +343,7 @@ class PathPlanningResult:
     max_route_attraction_cost: float
     path_cells: List[List[int]]
     obstacle_count: int
+    planner_hazard_active: bool = False
     used_cached_result: bool = False
     path_found: bool = False
 
@@ -370,6 +371,7 @@ class PathPlanningResult:
             },
             "path_enu_points": list(self.path_enu_points),
             "obstacle_count": int(self.obstacle_count),
+            "planner_hazard_active": bool(self.planner_hazard_active),
             "path_found": bool(self.path_found),
             "used_cached_result": bool(self.used_cached_result),
         }
@@ -568,6 +570,7 @@ class AStarGridResult:
     path_nodes: List[GridCoord]
     path_cells: List[GridCoord]
     path_enu: List[ENU]
+    planner_hazard_active: bool = False
 
 
 def _iter_cells_on_segment(start: GridCoord, end: GridCoord) -> Iterable[GridCoord]:
@@ -1466,6 +1469,10 @@ def astar_path(
                 path_nodes=path_nodes,
                 path_cells=path_cells,
                 path_enu=[frame.grid_to_enu(cell) for cell in path_nodes],
+                planner_hazard_active=(
+                    bool(ego_obstacle_active)
+                    or bool(colreg_evaluation.starboard_track_entered)
+                ),
             )
 
         current_g = g_score.get(current, float("inf"))
@@ -1519,6 +1526,10 @@ def astar_path(
         path_nodes=[],
         path_cells=[],
         path_enu=[],
+        planner_hazard_active=(
+            bool(ego_obstacle_active)
+            or bool(colreg_evaluation.starboard_track_entered)
+        ),
     )
 
 
@@ -1659,6 +1670,7 @@ class PathPlannerRuntime:
                     max_route_attraction_cost=float(self._last_result.max_route_attraction_cost),
                     path_cells=[list(cell) for cell in self._last_result.path_cells],
                     obstacle_count=self._last_result.obstacle_count,
+                    planner_hazard_active=self._last_result.planner_hazard_active,
                     used_cached_result=True,
                     path_found=self._last_result.path_found,
                 )
@@ -1751,6 +1763,7 @@ class PathPlannerRuntime:
                 max_route_attraction_cost=max_route_attraction_cost,
                 path_cells=[[int(cell[0]), int(cell[1])] for cell in grid_result.path_cells],
                 obstacle_count=len(obstacles),
+                planner_hazard_active=grid_result.planner_hazard_active,
                 used_cached_result=False,
                 path_found=len(path_points) >= 2,
             )
