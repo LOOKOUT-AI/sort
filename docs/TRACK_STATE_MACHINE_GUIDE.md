@@ -2,6 +2,8 @@
 
 This document is the single source of truth for how track status changes across the current `sort` backend and the `lookout-V2` frontend.
 
+For the end-to-end runtime workflow of the world-space constant-velocity tracker, see `docs/WORLD_SPACE_CONSTANT_VELOCITY_TRACKER_GUIDE.md`.
+
 It covers:
 
 - the conceptual states: `no track`, `warming/unconfirmed`, `matched`, `ghost`, `rewarming`, `deleted`

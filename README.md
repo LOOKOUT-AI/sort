@@ -5,6 +5,12 @@ This repo contains:
 - **Image-space and world-space** tracking modes built around the SORT idea.
 - A **legacy MOTChallenge demo** (kept for reference, not used by the bridge).
 
+Companion docs:
+- `docs/WORLD_SPACE_CONSTANT_VELOCITY_TRACKER_GUIDE.md` for the full frame-by-frame walkthrough of the world-space constant-velocity tracker
+- `docs/ASTAR_EGO_RELATIVE_PATH_PLANNER_GUIDE.md` for the full runtime walkthrough of the A* ego-relative path planner
+- `docs/TRACKER_PARAMETERS_GUIDE.md` for world-space tuning behavior
+- `docs/TRACK_STATE_MACHINE_GUIDE.md` for lifecycle and status semantics
+
 ## How SORT works (high level)
 
 SORT is a minimal multi-object tracker that combines:

@@ -2,6 +2,8 @@
 
 This document explains the tunable parameters for the world-space SORT tracker, how they interact, and how they affect the three types of output tracks. **Use case**: marine boat/other fusion with CV detections as the only source, where distance prediction has poor accuracy and stability.
 
+For the end-to-end runtime workflow of the world-space constant-velocity tracker, see `docs/WORLD_SPACE_CONSTANT_VELOCITY_TRACKER_GUIDE.md`.
+
 **Spreadsheet:** The same content is available as CSV files (`TRACKER_PARAMETERS_01_parameter_reference.csv`, etc.) and as a **single Excel workbook** with one sheet per table: **`TRACKER_PARAMETERS.xlsx`**. To regenerate the workbook from the CSVs, run from the repo root: `python docs/build_tracker_params_xlsx.py` (no extra dependencies).
 
 ---
