@@ -263,6 +263,15 @@ class KalmanCVPointTracker:
             "measurement_position_covariance_enu": _matrix2_to_nested_list(self.kf.R[:2, :2]),
         }
 
+    def get_measurement_noise_scalars(self) -> Dict[str, float]:
+        """Return the live radial/cross measurement variances used to build R."""
+        cross_var = max(1e-6, float(self.measurement_noise_cross_var_m2))
+        radial_var = max(1e-6, cross_var * max(1e-6, float(self.measurement_noise_radial_scale)))
+        return {
+            "measurement_noise_cross_var_m2": cross_var,
+            "measurement_noise_radial_var_m2": radial_var,
+        }
+
     def get_full_state(self) -> Dict[str, Any]:
         """Return full KF state as a dict: position, velocity, and covariance summaries."""
         x = self.kf.x.flatten()
@@ -278,6 +287,7 @@ class KalmanCVPointTracker:
             "course_deg": course,
             "accel_east_mps2": None,
             "accel_north_mps2": None,
+            **self.get_measurement_noise_scalars(),
             **self.get_position_covariances(),
         }
 
@@ -484,6 +494,15 @@ class KalmanCAPointTracker:
             "measurement_position_covariance_enu": _matrix2_to_nested_list(self.kf.R[:2, :2]),
         }
 
+    def get_measurement_noise_scalars(self) -> Dict[str, float]:
+        """Return the live radial/cross measurement variances used to build R."""
+        cross_var = max(1e-6, float(self.measurement_noise_cross_var_m2))
+        radial_var = max(1e-6, cross_var * max(1e-6, float(self.measurement_noise_radial_scale)))
+        return {
+            "measurement_noise_cross_var_m2": cross_var,
+            "measurement_noise_radial_var_m2": radial_var,
+        }
+
     def get_full_state(self) -> Dict[str, Any]:
         """Return full KF state as a dict: position, velocity, acceleration, and covariance summaries."""
         x = self.kf.x.flatten()
@@ -501,6 +520,7 @@ class KalmanCAPointTracker:
             "course_deg": course,
             "accel_east_mps2": ae,
             "accel_north_mps2": an,
+            **self.get_measurement_noise_scalars(),
             **self.get_position_covariances(),
         }
 
@@ -761,6 +781,8 @@ class WorldSpaceSort:
                             "course_deg": full_state["course_deg"],
                             "accel_east_mps2": full_state["accel_east_mps2"],
                             "accel_north_mps2": full_state["accel_north_mps2"],
+                            "measurement_noise_cross_var_m2": full_state["measurement_noise_cross_var_m2"],
+                            "measurement_noise_radial_var_m2": full_state["measurement_noise_radial_var_m2"],
                             "state_position_covariance_enu": full_state["state_position_covariance_enu"],
                             "process_position_covariance_enu": full_state["process_position_covariance_enu"],
                             "measurement_position_covariance_enu": full_state["measurement_position_covariance_enu"],
@@ -864,6 +886,8 @@ class WorldSpaceSort:
                 rewarming_entry["course_deg"] = full_state["course_deg"]
                 rewarming_entry["accel_east_mps2"] = full_state["accel_east_mps2"]
                 rewarming_entry["accel_north_mps2"] = full_state["accel_north_mps2"]
+                rewarming_entry["measurement_noise_cross_var_m2"] = full_state["measurement_noise_cross_var_m2"]
+                rewarming_entry["measurement_noise_radial_var_m2"] = full_state["measurement_noise_radial_var_m2"]
                 rewarming_entry["state_position_covariance_enu"] = full_state["state_position_covariance_enu"]
                 rewarming_entry["process_position_covariance_enu"] = full_state["process_position_covariance_enu"]
                 rewarming_entry["measurement_position_covariance_enu"] = full_state["measurement_position_covariance_enu"]
@@ -905,6 +929,8 @@ class WorldSpaceSort:
                     "course_deg": full_state["course_deg"],
                     "accel_east_mps2": full_state["accel_east_mps2"],
                     "accel_north_mps2": full_state["accel_north_mps2"],
+                    "measurement_noise_cross_var_m2": full_state["measurement_noise_cross_var_m2"],
+                    "measurement_noise_radial_var_m2": full_state["measurement_noise_radial_var_m2"],
                     "state_position_covariance_enu": full_state["state_position_covariance_enu"],
                     "process_position_covariance_enu": full_state["process_position_covariance_enu"],
                     "measurement_position_covariance_enu": full_state["measurement_position_covariance_enu"],

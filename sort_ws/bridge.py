@@ -258,6 +258,8 @@ async def _track_world_space(
             det2["course_deg"] = kf_state["course_deg"]
             det2["accel_east_mps2"] = kf_state["accel_east_mps2"]
             det2["accel_north_mps2"] = kf_state["accel_north_mps2"]
+            det2["measurement_noise_cross_var_m2"] = kf_state["measurement_noise_cross_var_m2"]
+            det2["measurement_noise_radial_var_m2"] = kf_state["measurement_noise_radial_var_m2"]
             det2["state_position_covariance_enu"] = kf_state["state_position_covariance_enu"]
             det2["process_position_covariance_enu"] = kf_state["process_position_covariance_enu"]
             det2["measurement_position_covariance_enu"] = kf_state["measurement_position_covariance_enu"]
