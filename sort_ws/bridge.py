@@ -309,7 +309,9 @@ async def _track_world_space(
             det2["enu_ref_lon"] = enu_ref_lon
             # KF kinematic state fields (vel_*, speed_mps, etc.) already included by assign().
             
-            # Add back-projected image-space fields using stored bbox geometry
+            # Keep the historical ghost back-projection logic here for future reference,
+            # but stop emitting image-space bbox fields so ghost tracks do not render on
+            # the AR/video overlays.
             last_y = unmatched.get("last_y_px")
             last_width = unmatched.get("last_width_px")
             last_height = unmatched.get("last_height_px")
@@ -319,10 +321,10 @@ async def _track_world_space(
             width_px = float(last_width) if last_width is not None and not math.isnan(last_width) else 50.0
             height_px = float(last_height) if last_height is not None and not math.isnan(last_height) else 50.0
             
-            det2["x"] = float(x_center_px - width_px / 2.0)
-            det2["y"] = y_px
-            det2["width"] = width_px
-            det2["height"] = height_px
+            # det2["x"] = float(x_center_px - width_px / 2.0)
+            # det2["y"] = y_px
+            # det2["width"] = width_px
+            # det2["height"] = height_px
             det2["distance"] = float(distance_m)
             det2["world_rel_ego_east_m"] = float(enu_rel_ego.east_m)
             det2["world_rel_ego_north_m"] = float(enu_rel_ego.north_m)
