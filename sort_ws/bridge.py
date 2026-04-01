@@ -939,8 +939,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--world-space-measurement-radial-scale",
         dest="world_space_measurement_noise_radial_scale",
         type=float,
-        default=1.0,
-        help="Scale factor applied to the measurement covariance along the radial ego-to-target direction. 1.0 keeps measurement noise isotropic; values > 1 smooth radial jitter more aggressively.",
+        default=20.0,
+        help="Scale factor applied to the measurement covariance along the radial ego-to-target direction. 20.0 is the tuned default; values > 1 smooth radial jitter more aggressively.",
     )
 
     # Per-category kinematic caps (always active; use a large value to effectively uncap)
