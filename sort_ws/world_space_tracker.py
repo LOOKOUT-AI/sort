@@ -103,13 +103,13 @@ class KalmanCVPointTracker:
         meas_enu: np.ndarray,
         extras: WorldTrackExtras,
         *,
-        q_intensity: float = 10.0,
-        measurement_noise_cross_var_m2: float = 160.0,
+        q_intensity: float = 0.0,
+        measurement_noise_cross_var_m2: float = 1e6,
         max_speed_boat_mps: float = 50.0,
         max_speed_other_mps: float = 50.0,
         max_accel_boat_mps2: float = 20.0,   # accepted but unused (CV has no accel state)
         max_accel_other_mps2: float = 20.0,  # accepted but unused
-        measurement_noise_radial_scale: float = 20.0,
+        measurement_noise_radial_scale: float = 200.0,
     ):
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
         self.kf.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
@@ -307,13 +307,13 @@ class KalmanCAPointTracker:
         meas_enu: np.ndarray,
         extras: WorldTrackExtras,
         *,
-        q_intensity: float = 1.0,
-        measurement_noise_cross_var_m2: float = 4.0,
+        q_intensity: float = 0.0,
+        measurement_noise_cross_var_m2: float = 1e6,
         max_speed_boat_mps: float = 50.0,
         max_speed_other_mps: float = 50.0,
         max_accel_boat_mps2: float = 20.0,
         max_accel_other_mps2: float = 20.0,
-        measurement_noise_radial_scale: float = 20.0,
+        measurement_noise_radial_scale: float = 200.0,
     ):
         self.kf = KalmanFilter(dim_x=6, dim_z=2)
         self.kf.H = np.array(
@@ -642,7 +642,7 @@ class WorldSpaceSort:
         world_space_kf_model: str = "cv",
         world_space_q_intensity: Optional[float] = None,
         world_space_measurement_noise_cross_var_m2: Optional[float] = None,
-        world_space_measurement_noise_radial_scale: float = 20.0,
+        world_space_measurement_noise_radial_scale: float = 200.0,
         # Per-category kinematic caps (always active; use a large value to effectively uncap).
         world_space_max_speed_boat_mps: float = 50.0,
         world_space_max_speed_other_mps: float = 50.0,
@@ -663,8 +663,8 @@ class WorldSpaceSort:
         self.kf_model = kf_model
         self._tracker_class = KalmanCAPointTracker if kf_model == "ca" else KalmanCVPointTracker
 
-        default_q_intensity = 1.0 if kf_model == "ca" else 10.0
-        default_measurement_noise_cross_var_m2 = 4.0 if kf_model == "ca" else 160.0
+        default_q_intensity = 0.0
+        default_measurement_noise_cross_var_m2 = 1e6
 
         # Kinematic caps forwarded to each tracker instance.
         self._tracker_kwargs: Dict[str, float] = {

@@ -926,21 +926,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="world_space_q_intensity",
         type=float,
         default=None,
-        help="Process-noise intensity for the world-space KF motion model. If omitted, uses the model-specific default.",
+        help="Process-noise intensity for the world-space KF motion model. If omitted, defaults to 0.0.",
     )
     p.add_argument(
         "--world-space-measurement-cross-var-m2",
         dest="world_space_measurement_noise_cross_var_m2",
         type=float,
         default=None,
-        help="Base world-space measurement covariance across the radial line-of-sight direction, in square meters. If omitted, uses the model-specific default.",
+        help="Base world-space measurement covariance across the radial line-of-sight direction, in square meters. If omitted, defaults to 1e6.",
     )
     p.add_argument(
         "--world-space-measurement-radial-scale",
         dest="world_space_measurement_noise_radial_scale",
         type=float,
-        default=20.0,
-        help="Scale factor applied to the measurement covariance along the radial ego-to-target direction. 20.0 is the tuned default; values > 1 smooth radial jitter more aggressively.",
+        default=200.0,
+        help="Scale factor applied to the measurement covariance along the radial ego-to-target direction. 200.0 is the default; values > 1 smooth radial jitter more aggressively.",
     )
 
     # Per-category kinematic caps (always active; use a large value to effectively uncap)
