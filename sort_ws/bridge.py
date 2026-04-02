@@ -50,6 +50,13 @@ class BridgeConfig:
     # Logging
     # If > 0, print a simple progress line every N upstream video frames.
     log_every_n_frames: int = 0
+    input_min_confidence: float = 0.0
+
+
+@dataclass
+class SharedTrackerRuntimeState:
+    # Drop raw detections below this confidence before either tracker sees them.
+    input_min_confidence: float = 0.0
 
 
 class BroadcastHub:
@@ -136,6 +143,77 @@ class PlaybackInfoCache:
 
 def _ws_url(host: str, port: int) -> str:
     return f"ws://{host}:{port}"
+
+
+def _summarize_tracker_states(tracker: Any) -> Dict[str, int]:
+    counts = {
+        "tracks": 0,
+        "warming_unconfirmed": 0,
+        "matched": 0,
+        "rewarming": 0,
+        "ghost": 0,
+    }
+    try:
+        trackers = list(getattr(tracker, "trackers", []) or [])
+        min_hits = int(getattr(tracker, "min_hits", 0))
+    except Exception:
+        return counts
+
+    counts["tracks"] = len(trackers)
+    for trk in trackers:
+        try:
+            hits = int(getattr(trk, "hits", 0))
+            hit_streak = int(getattr(trk, "hit_streak", 0))
+            time_since_update = int(getattr(trk, "time_since_update", 0))
+        except Exception:
+            counts["warming_unconfirmed"] += 1
+            continue
+
+        # Mirror the guide/current tracker behavior:
+        # - matched: confirmed and matched this frame
+        # - ghost: confirmed but unmatched this frame
+        # - rewarming: previously confirmed, matched again, but not reconfirmed yet
+        # - warming_unconfirmed: everything else still short of confirmed output
+        if time_since_update > 0 and hits >= min_hits:
+            counts["ghost"] += 1
+        elif time_since_update == 0 and hit_streak >= min_hits:
+            counts["matched"] += 1
+        elif time_since_update == 0 and hits > min_hits:
+            counts["rewarming"] += 1
+        else:
+            counts["warming_unconfirmed"] += 1
+    return counts
+
+
+def _filtered_bboxes_for_tracking(
+    bboxes: List[Dict[str, Any]],
+    runtime_state: SharedTrackerRuntimeState,
+) -> List[Dict[str, Any]]:
+    threshold = float(getattr(runtime_state, "input_min_confidence", 0.0) or 0.0)
+    if threshold <= 0.0:
+        return bboxes
+
+    filtered: List[Dict[str, Any]] = []
+    for bbox in bboxes:
+        if not isinstance(bbox, dict):
+            continue
+        try:
+            confidence = float(bbox.get("confidence", float("nan")))
+        except Exception:
+            confidence = float("nan")
+        if not math.isnan(confidence) and confidence < threshold:
+            continue
+        filtered.append(bbox)
+    return filtered
+
+
+def _get_tracker_params_payload(
+    world_tracker: Optional[WorldSpaceSort],
+    runtime_state: SharedTrackerRuntimeState,
+) -> Dict[str, Any]:
+    params = world_tracker.get_tunable_params() if world_tracker is not None else {}
+    params["input_min_confidence"] = float(getattr(runtime_state, "input_min_confidence", 0.0) or 0.0)
+    return params
 
 
 def _track_image_space(bboxes: list, tracker: ImageSpaceSort) -> List[Dict[str, Any]]:
@@ -344,6 +422,7 @@ async def _process_video_payload(
     path_planner: Optional[PathPlannerRuntime],
     video_hub: BroadcastHub,
     frame_counter: List[int],
+    runtime_state: SharedTrackerRuntimeState,
     source_label: str = "upstream",
 ) -> None:
     """Shared tracking pipeline for both upstream replay and simulation ingestion."""
@@ -352,15 +431,16 @@ async def _process_video_payload(
     bboxes = vm.metadata.get("bboxes", [])
     if not isinstance(bboxes, list):
         bboxes = []
+    bboxes_for_tracking = _filtered_bboxes_for_tracking(bboxes, runtime_state)
 
     # Always compute image-space tracks.
-    tracked_local = _track_image_space(bboxes, image_tracker)
+    tracked_local = _track_image_space(bboxes_for_tracking, image_tracker)
 
     # Also compute world-space tracks when possible (may be empty until ego arrives).
     tracked_world: List[Dict[str, Any]] = []
     if world_tracker is not None and ego_store is not None:
         tracked_world = await _track_world_space(
-            bboxes=bboxes,
+            bboxes=bboxes_for_tracking,
             world_tracker=world_tracker,
             ego_store=ego_store,
             cfg=cfg,
@@ -408,10 +488,7 @@ async def _process_video_payload(
 
     if cfg.log_every_n_frames and frame_counter[0] % int(cfg.log_every_n_frames) == 0:
         active = world_tracker if (selected_space == "world_space" and world_tracker is not None) else image_tracker
-        try:
-            active_tracks = len(active.trackers)
-        except Exception:
-            active_tracks = -1
+        active_counts = _summarize_tracker_states(active)
         try:
             active_frame_count = int(getattr(active, "frame_count", -1))
         except Exception:
@@ -422,7 +499,13 @@ async def _process_video_payload(
             active_max_age = -1
         print(
             f"[sort-ws] [{source_label}] frames={frame_counter[0]} "
-            f"tracker_frames={active_frame_count} tracks={active_tracks} max_age={active_max_age}"
+            f"tracker_frames={active_frame_count} "
+            f"tracks={active_counts['tracks']} "
+            f"warming_unconfirmed={active_counts['warming_unconfirmed']} "
+            f"matched={active_counts['matched']} "
+            f"rewarming={active_counts['rewarming']} "
+            f"ghost={active_counts['ghost']} "
+            f"max_age={active_max_age}"
         )
 
 
@@ -434,6 +517,7 @@ async def _upstream_video_loop(
     ego_store: Optional[EgoStateStore],
     path_planner: Optional[PathPlannerRuntime],
     video_hub: BroadcastHub,
+    runtime_state: SharedTrackerRuntimeState,
 ) -> None:
     url = _ws_url(cfg.upstream_host, cfg.upstream_video_port)
     frame_counter = [0]
@@ -454,6 +538,7 @@ async def _upstream_video_loop(
                         path_planner=path_planner,
                         video_hub=video_hub,
                         frame_counter=frame_counter,
+                        runtime_state=runtime_state,
                         source_label="upstream",
                     )
         except asyncio.CancelledError:
@@ -547,6 +632,7 @@ async def _downstream_control_handler(
     playback_cache: PlaybackInfoCache,
     world_tracker: Optional[WorldSpaceSort] = None,
     path_planner: Optional[PathPlannerRuntime] = None,
+    runtime_state: Optional[SharedTrackerRuntimeState] = None,
 ) -> None:
     await control_hub.register(ws)
     try:
@@ -566,8 +652,8 @@ async def _downstream_control_handler(
 
         # Send current tracker params to newly connected clients.
         try:
-            if world_tracker is not None:
-                await ws.send(json.dumps({"tracker_params": world_tracker.get_tunable_params()}))
+            if runtime_state is not None:
+                await ws.send(json.dumps({"tracker_params": _get_tracker_params_payload(world_tracker, runtime_state)}))
         except Exception:
             pass
 
@@ -618,16 +704,25 @@ async def _downstream_control_handler(
 
                 # --- Tracker param commands (intercepted, NOT forwarded upstream) ---
                 if cmd == "get_tracker_params":
-                    if world_tracker is not None:
+                    if runtime_state is not None:
                         try:
-                            await ws.send(json.dumps({"tracker_params": world_tracker.get_tunable_params()}))
+                            await ws.send(json.dumps({"tracker_params": _get_tracker_params_payload(world_tracker, runtime_state)}))
                         except Exception:
                             pass
                     continue
                 if cmd == "set_tracker_params":
-                    if world_tracker is not None:
+                    if runtime_state is not None:
                         new_params = {k: v for k, v in obj.items() if k not in ("command", "cmd")}
-                        updated = world_tracker.set_tunable_params(new_params)
+                        raw_input_min_conf = new_params.pop("input_min_confidence", None)
+                        if raw_input_min_conf is not None:
+                            try:
+                                runtime_state.input_min_confidence = max(0.0, float(raw_input_min_conf))
+                            except (TypeError, ValueError):
+                                pass
+                        updated = _get_tracker_params_payload(world_tracker, runtime_state)
+                        if world_tracker is not None:
+                            updated.update(world_tracker.set_tunable_params(new_params))
+                        updated["input_min_confidence"] = float(runtime_state.input_min_confidence)
                         try:
                             await ws.send(json.dumps({"ack": "set_tracker_params", "tracker_params": updated}))
                         except Exception:
@@ -673,6 +768,7 @@ async def _sim_video_handler(
     ego_store: Optional[EgoStateStore],
     path_planner: Optional[PathPlannerRuntime],
     video_hub: BroadcastHub,
+    runtime_state: SharedTrackerRuntimeState,
 ) -> None:
     """Accept video+bbox messages from the frontend simulator."""
     print("[sort-ws] Simulation video client connected")
@@ -691,6 +787,7 @@ async def _sim_video_handler(
                 path_planner=path_planner,
                 video_hub=video_hub,
                 frame_counter=frame_counter,
+                        runtime_state=runtime_state,
                 source_label="sim",
             )
     except ConnectionClosed:
@@ -733,6 +830,7 @@ async def run_bridge(
     mode_state = TrackingModeState(cfg.mode)
     playback_cache = PlaybackInfoCache()
     path_planner = PathPlannerRuntime()
+    runtime_state = SharedTrackerRuntimeState(input_min_confidence=float(cfg.input_min_confidence))
 
     # Start downstream servers and keep the returned server objects alive.
     video_server = await websockets.serve(
@@ -756,6 +854,7 @@ async def run_bridge(
             playback_cache,
             world_tracker,
             path_planner,
+            runtime_state,
         ),
         cfg.downstream_bind,
         cfg.downstream_control_port,
@@ -775,6 +874,7 @@ async def run_bridge(
                 ego_store=ego_store,
                 path_planner=path_planner,
                 video_hub=video_hub,
+                runtime_state=runtime_state,
             ),
             cfg.downstream_bind,
             cfg.sim_video_port,
@@ -806,7 +906,7 @@ async def run_bridge(
 
     try:
         await asyncio.gather(
-            _upstream_video_loop(cfg, mode_state, image_tracker, world_tracker, ego_store, path_planner, video_hub),
+            _upstream_video_loop(cfg, mode_state, image_tracker, world_tracker, ego_store, path_planner, video_hub, runtime_state),
             _upstream_nmea_loop(cfg, nmea_hub, ego_store),
             _upstream_control_loop(cfg, control_hub, outbound_to_upstream, playback_cache),
         )
@@ -844,13 +944,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--image-space-alpha-distance", dest="image_space_alpha_distance", type=float, default=0.15)
     p.add_argument("--image-space-beta-heading", dest="image_space_beta_heading", type=float, default=0.0)
     p.add_argument("--image-space-gamma-confidence", dest="image_space_gamma_confidence", type=float, default=0.0)
-    p.add_argument(
-        "--image-space-new-track-min-confidence",
-        dest="image_space_new_track_min_confidence",
-        type=float,
-        default=0.0,
-    )
-
     p.add_argument("--reconnect-delay-s", type=float, default=1.0)
 
     # World-space tracking
@@ -906,12 +999,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Weight for (1-confidence) in world association cost.",
-    )
-    p.add_argument(
-        "--world-space-new-track-min-confidence",
-        dest="world_space_new_track_min_confidence",
-        type=float,
-        default=0.0,
     )
     p.add_argument(
         "--world-space-kf-model",
@@ -995,6 +1082,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="If > 0, print a progress line every N upstream video frames (includes tracker frame_count / max_age).",
     )
+    p.add_argument(
+        "--input-min-confidence",
+        type=float,
+        default=0.0,
+        help="Drop raw detections below this confidence before either tracker processes them.",
+    )
 
     return p
 
@@ -1019,6 +1112,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         sim_video_port=int(args.sim_video_port),
         sim_nmea_port=int(args.sim_nmea_port),
         log_every_n_frames=int(args.log_every_n_frames),
+        input_min_confidence=float(args.input_min_confidence),
     )
 
     image_tracker = ImageSpaceSort(
@@ -1028,7 +1122,6 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         image_space_alpha_distance=args.image_space_alpha_distance,
         image_space_beta_heading=args.image_space_beta_heading,
         image_space_gamma_confidence=args.image_space_gamma_confidence,
-        image_space_new_track_min_confidence=args.image_space_new_track_min_confidence,
     )
 
     # Always initialize world-space tracking components so downstream can switch modes at runtime.
@@ -1039,7 +1132,6 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         world_space_max_distance_m=args.world_space_max_distance_m,
         world_space_beta_heading=args.world_space_beta_heading,
         world_space_gamma_confidence=args.world_space_gamma_confidence,
-        world_space_new_track_min_confidence=args.world_space_new_track_min_confidence,
         world_space_kf_model=args.world_space_kf_model,
         world_space_q_intensity=args.world_space_q_intensity,
         world_space_measurement_noise_cross_var_m2=args.world_space_measurement_noise_cross_var_m2,

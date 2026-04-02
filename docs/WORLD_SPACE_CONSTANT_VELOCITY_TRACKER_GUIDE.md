@@ -401,13 +401,9 @@ For documentation purposes, the code behavior is the source of truth: rewarming 
 
 ## Step 8: Create New Tracks From Unmatched Detections
 
-Every unmatched detection is a candidate birth.
+Every unmatched detection that already survived bridge-level `input_min_confidence` filtering is a candidate birth.
 
-Before creating a tracker, the code checks:
-
-- `confidence >= new_track_min_confidence`
-
-If the detection passes, the tracker allocates a new `KalmanCVPointTracker` with:
+The tracker then allocates a new `KalmanCVPointTracker` with:
 
 - the current ENU position as initial state position
 - zero initial velocity

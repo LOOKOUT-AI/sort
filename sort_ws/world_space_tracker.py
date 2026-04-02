@@ -638,7 +638,6 @@ class WorldSpaceSort:
         world_space_max_distance_m: float = 30.0,
         world_space_beta_heading: float = 0.0,
         world_space_gamma_confidence: float = 0.0,
-        world_space_new_track_min_confidence: float = 0.0,
         world_space_kf_model: str = "cv",
         world_space_q_intensity: Optional[float] = None,
         world_space_measurement_noise_cross_var_m2: Optional[float] = None,
@@ -655,7 +654,6 @@ class WorldSpaceSort:
         self.max_distance_m = float(world_space_max_distance_m)
         self.beta_heading = float(world_space_beta_heading)
         self.gamma_confidence = float(world_space_gamma_confidence)
-        self.new_track_min_confidence = float(world_space_new_track_min_confidence)
 
         kf_model = str(world_space_kf_model).strip().lower()
         if kf_model not in ("cv", "ca"):
@@ -895,9 +893,6 @@ class WorldSpaceSort:
             # else: never confirmed (hits < min_hits), no output
 
         for det_idx in unmatched_dets:
-            conf = float(det_extras[int(det_idx)].confidence)
-            if not np.isnan(conf) and conf < self.new_track_min_confidence:
-                continue
             trk = self._tracker_class(det_xy[int(det_idx), :], det_extras[int(det_idx)], **self._tracker_kwargs)
             self.trackers.append(trk)
             track_id = int(trk.id) + 1

@@ -228,7 +228,7 @@ For local network and development, JSON's debuggability outweighs the bandwidth 
     "max_age_frames": 300,
     "max_age_seconds": 10.0,
     "min_hits_to_confirm": 40,
-    "new_track_min_confidence": 0.5,
+    "input_min_confidence": 0.5,
     "kalman_filter": {
       "process_noise_position_q": 1.0,
       "process_noise_velocity_q": 0.5,

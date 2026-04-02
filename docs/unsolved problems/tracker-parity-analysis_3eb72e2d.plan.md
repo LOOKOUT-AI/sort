@@ -20,7 +20,7 @@ isProject: false
 
 The two trackers already share the same high-level lifecycle skeleton for `no track -> warming -> matched -> ghost -> rewarming -> matched/deleted`:
 
-- New unmatched detections can spawn trackers if they pass `*_new_track_min_confidence`.
+- New unmatched detections can spawn trackers if they survive the bridge-level `input_min_confidence` filter.
 - A track becomes externally `matched` only when `hit_streak >= min_hits`.
 - A confirmed track becomes `ghost` after one missed frame.
 - A confirmed ghost becomes `rewarming` after a recovery match when the rebuilt streak is still `< min_hits`.

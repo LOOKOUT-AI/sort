@@ -332,7 +332,6 @@ class ImageSpaceSort:
         image_space_alpha_distance: float = 0.0,
         image_space_beta_heading: float = 0.0,
         image_space_gamma_confidence: float = 0.0,
-        image_space_new_track_min_confidence: float = 0.0,
     ):
         # Keep attribute names short/stable for runtime introspection/logging.
         self.max_age = int(image_space_max_age)
@@ -341,7 +340,6 @@ class ImageSpaceSort:
         self.alpha_distance = float(image_space_alpha_distance)
         self.beta_heading = float(image_space_beta_heading)
         self.gamma_confidence = float(image_space_gamma_confidence)
-        self.new_track_min_confidence = float(image_space_new_track_min_confidence)
 
         self.trackers: List[KalmanBoxTracker] = []
         self.frame_count = 0
@@ -510,9 +508,6 @@ class ImageSpaceSort:
 
         # Create and initialize new trackers for unmatched detections.
         for det_idx in unmatched_dets:
-            conf = float(det_extras[int(det_idx)].confidence)
-            if not np.isnan(conf) and conf < self.new_track_min_confidence:
-                continue
             trk = KalmanBoxTracker(det_xyxy[int(det_idx), :], det_extras[int(det_idx)])
             self.trackers.append(trk)
             track_id = int(trk.id) + 1

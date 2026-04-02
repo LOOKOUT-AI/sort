@@ -46,7 +46,7 @@ Those counters are what actually drive transitions.
 flowchart TD
     subgraph preconditions [PreconditionsAndMatchDecision]
         frontendFilter["lookout-V2 live render filter\nbbox.confidence >= 0.1 to be drawn"]
-        newTrackGate["Birth gate\nunmatched detection confidence >= *_new_track_min_confidence"]
+        inputGate["Input confidence gate\nconfidence >= input_min_confidence"]
         imageGate["Image-space gate\nIOU >= image_space_iou_threshold"]
         worldGate["World-space gate\ndistance <= world_space_max_distance_m"]
         assignStep["Association + Hungarian assignment"]
@@ -64,13 +64,14 @@ flowchart TD
     end
 
     frontendFilter -.-> assignStep
+    inputGate --> assignStep
     imageGate --> assignStep
     worldGate --> assignStep
     assignStep --> matchedFrame
     assignStep --> missedFrame
 
-    noTrack -->|"unmatched detection passes new-track gate /\ncreate tracker, initialize hits=1, hit_streak=1, time_since_update=0"| warming
-    noTrack -->|"no valid detection, filtered detection, or confidence below birth gate /\nstay without tracker"| noTrack
+    noTrack -->|"unmatched detection survives input filtering /\ncreate tracker, initialize hits=1, hit_streak=1, time_since_update=0"| warming
+    noTrack -->|"no valid detection, filtered detection, or confidence below input gate /\nstay without tracker"| noTrack
 
     warming -->|"matchedFrame and hit_streak + 1 < min_hits /\nupdate(), hits += 1, hit_streak += 1, still internal only"| warming
     warming -->|"matchedFrame and hit_streak + 1 >= min_hits /\nupdate(), hits += 1, hit_streak reaches min_hits, begin emitting matched"| matched
@@ -118,8 +119,8 @@ So a track state change always starts from one of two events:
   - consecutive matches required to become or return to `matched`
 - `max_age`
   - maximum tolerated missed frames before deletion
-- `*_new_track_min_confidence`
-  - required confidence for an unmatched detection to create a brand new tracker
+- `input_min_confidence`
+  - required confidence for a raw detection to enter either tracker at all
 - `image_space_iou_threshold`
   - image-space association gate
 - `world_space_max_distance_m`
@@ -159,13 +160,13 @@ If you want the defaults used by normal `sort-3d.py` launches, the CLI defaults 
 
 #### Image space
 
+- `input_min_confidence = 0.0`
 - `image_space_max_age = 40`
 - `image_space_min_hits = 300`
 - `image_space_iou_threshold = 0.1`
 - `image_space_alpha_distance = 0.15`
 - `image_space_beta_heading = 0.0`
 - `image_space_gamma_confidence = 0.0`
-- `image_space_new_track_min_confidence = 0.0`
 
 #### World space
 
@@ -174,7 +175,6 @@ If you want the defaults used by normal `sort-3d.py` launches, the CLI defaults 
 - `world_space_max_distance_m = 50.0`
 - `world_space_beta_heading = 0.0`
 - `world_space_gamma_confidence = 0.0`
-- `world_space_new_track_min_confidence = 0.0`
 
 ## State-By-State Explanation
 
@@ -190,7 +190,7 @@ How you stay in `NoTrack`:
 
 - no detection exists for this target
 - detection is filtered out before use
-- detection does not pass `*_new_track_min_confidence`
+- detection does not pass `input_min_confidence`
 
 How you leave `NoTrack`:
 
@@ -200,7 +200,7 @@ What "unmatched detection creates a new tracker" means:
 
 - the association step could not match that detection to any existing tracker
 - so it becomes an unmatched detection
-- if its confidence passes `*_new_track_min_confidence`, the tracker allocates a brand new internal track object for it
+- if it survives `input_min_confidence`, the tracker allocates a brand new internal track object for it when it remains unmatched
 
 ### 2. `WarmingOrUnconfirmed`
 
@@ -350,8 +350,8 @@ Once deleted:
 
 | From | To | Condition |
 |------|----|-----------|
-| `NoTrack` | `WarmingOrUnconfirmed` | detection is not matched to an existing track and passes `*_new_track_min_confidence` |
-| `NoTrack` | `NoTrack` | no valid detection, detection filtered out, or confidence below new-track gate |
+| `NoTrack` | `WarmingOrUnconfirmed` | detection is not matched to an existing track and passes `input_min_confidence` |
+| `NoTrack` | `NoTrack` | no valid detection, detection filtered out, or confidence below input gate |
 | `WarmingOrUnconfirmed` | `WarmingOrUnconfirmed` | another match occurs but `hit_streak < min_hits` |
 | `WarmingOrUnconfirmed` | `Matched` | matched frame makes `hit_streak >= min_hits` |
 | `WarmingOrUnconfirmed` | `Deleted` | `time_since_update > max_age` before ever confirming |
@@ -435,7 +435,7 @@ That means playback timestamp reconstruction is useful for stable ID playback, b
 
 Assume `min_hits = 5`.
 
-- frame 1: detection is unmatched to any existing track and passes birth confidence -> `WarmingOrUnconfirmed`
+- frame 1: detection is unmatched to any existing track and passes input confidence filtering -> `WarmingOrUnconfirmed`
 - frame 2: matched again -> still `WarmingOrUnconfirmed`
 - frame 3: matched again -> still `WarmingOrUnconfirmed`
 - frame 4: matched again -> still `WarmingOrUnconfirmed`
@@ -465,7 +465,7 @@ Assume `max_age = 50`.
 
 - `min_hits` controls both first confirmation and recovery confirmation.
 - `max_age` controls how long a missed confirmed track can remain alive before deletion.
-- `*_new_track_min_confidence` only controls whether a new unmatched detection is allowed to start a tracker.
+- `input_min_confidence` is the only confidence gate on tracker input; detections below it never reach image-space or world-space association.
 - `world_space_max_distance_m` and `image_space_iou_threshold` determine whether a frame is treated as matched or missed at all.
 - `warming` and `rewarming` are not the same:
   - warming = new birth, never confirmed
