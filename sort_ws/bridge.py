@@ -207,6 +207,17 @@ def _filtered_bboxes_for_tracking(
     return filtered
 
 
+def _parse_bool_arg(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if lowered in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value!r}")
+
+
 def _get_tracker_params_payload(
     world_tracker: Optional[WorldSpaceSort],
     runtime_state: SharedTrackerRuntimeState,
@@ -295,13 +306,16 @@ async def _track_world_space(
         det2["world_rel_ego_north_m"] = float(enu_rel_ego.north_m)
         world_dets.append(det2)
 
-    assigned_ids, unmatched_tracks, matched_track_states = world_tracker.assign(world_dets)
+    ego_enu_from_ref = latlon_to_enu_m(local_ref, ego.latlon)
+    assigned_ids, unmatched_tracks, matched_track_states = world_tracker.assign(
+        world_dets,
+        ego_enu_from_ref=ego_enu_from_ref,
+    )
     tracked_bboxes: List[Dict[str, Any]] = []
 
     # ENU reference point (same for all tracks, set once per session)
     enu_ref_lat = float(local_ref.lat)
     enu_ref_lon = float(local_ref.lon)
-    ego_enu_from_ref = latlon_to_enu_m(local_ref, ego.latlon)
     
     # Process matched detections
     for det, track_id in zip(world_dets, assigned_ids):
@@ -983,7 +997,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--world-space-max-distance-m",
         dest="world_space_max_distance_m",
         type=float,
-        default=50.0,
+        default=100.0,
         help="Max world-space (meters) to allow a detection to match a track.",
     )
     p.add_argument(
@@ -1058,6 +1072,104 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Max acceleration cap for non-boat category tracks (m/s²). Only used with CA model. 0 = clamp acceleration to zero. Use a large value (e.g. 100) to effectively uncap.",
+    )
+    p.add_argument(
+        "--world-space-enable-track-prefilter",
+        dest="world_space_enable_track_prefilter",
+        type=_parse_bool_arg,
+        default=False,
+        help="Enable pre-filtering predicted tracks by ego-relative range before Hungarian association.",
+    )
+    p.add_argument(
+        "--world-space-enable-detection-prefilter",
+        dest="world_space_enable_detection_prefilter",
+        type=_parse_bool_arg,
+        default=False,
+        help="Enable pre-filtering detections by ego-relative range before Hungarian association.",
+    )
+    p.add_argument(
+        "--world-space-enable-track-dedup",
+        dest="world_space_enable_track_dedup",
+        type=_parse_bool_arg,
+        default=False,
+        help="Enable duplicate-track suppression before Hungarian association.",
+    )
+    p.add_argument(
+        "--world-space-enable-detection-dedup",
+        dest="world_space_enable_detection_dedup",
+        type=_parse_bool_arg,
+        default=False,
+        help="Enable duplicate-detection suppression before Hungarian association.",
+    )
+    p.add_argument(
+        "--world-space-prefilter-max-range-m",
+        dest="world_space_prefilter_max_range_m",
+        type=float,
+        default=300.0,
+        help="Maximum ego-relative range for optional world-space pre-filtering.",
+    )
+    p.add_argument(
+        "--world-space-deduplication-min-distance-m",
+        dest="world_space_deduplication_min_distance_m",
+        type=float,
+        default=0.0,
+        help="Lower clamp bound for position-similarity remapping in deduplication.",
+    )
+    p.add_argument(
+        "--world-space-deduplication-max-distance-m",
+        dest="world_space_deduplication_max_distance_m",
+        type=float,
+        default=100.0,
+        help="Upper clamp bound for position-similarity remapping in deduplication.",
+    )
+    p.add_argument(
+        "--world-space-deduplication-min-speed-diff-mps",
+        dest="world_space_deduplication_min_speed_diff_mps",
+        type=float,
+        default=0.0,
+        help="Lower clamp bound for speed-difference similarity remapping in track deduplication.",
+    )
+    p.add_argument(
+        "--world-space-deduplication-max-speed-diff-mps",
+        dest="world_space_deduplication_max_speed_diff_mps",
+        type=float,
+        default=10.0,
+        help="Upper clamp bound for speed-difference similarity remapping in track deduplication.",
+    )
+    p.add_argument(
+        "--world-space-track-similarity-position-weight",
+        dest="world_space_track_similarity_position_weight",
+        type=float,
+        default=1.0,
+        help="Weight for position similarity in track deduplication.",
+    )
+    p.add_argument(
+        "--world-space-track-similarity-direction-weight",
+        dest="world_space_track_similarity_direction_weight",
+        type=float,
+        default=1.0,
+        help="Weight for direction similarity in track deduplication.",
+    )
+    p.add_argument(
+        "--world-space-track-similarity-speed-weight",
+        dest="world_space_track_similarity_speed_weight",
+        type=float,
+        default=1.0,
+        help="Weight for speed-difference similarity in track deduplication.",
+    )
+    p.add_argument(
+        "--world-space-track-similarity-score-threshold",
+        dest="world_space_track_similarity_score_threshold",
+        type=float,
+        default=0.9,
+        help="Score threshold for considering two predicted tracks duplicates.",
+    )
+    p.add_argument(
+        "--world-space-detection-similarity-score-threshold",
+        dest="world_space_detection_similarity_score_threshold",
+        type=float,
+        default=0.9,
+        help="Score threshold for considering two detections duplicates.",
     )
 
     # Simulation ingestion ports (bridge acts as server, frontend connects as client)
@@ -1140,6 +1252,20 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         world_space_max_speed_other_mps=args.world_space_max_speed_other_mps,
         world_space_max_accel_boat_mps2=args.world_space_max_accel_boat_mps2,
         world_space_max_accel_other_mps2=args.world_space_max_accel_other_mps2,
+        world_space_enable_track_prefilter=args.world_space_enable_track_prefilter,
+        world_space_enable_detection_prefilter=args.world_space_enable_detection_prefilter,
+        world_space_enable_track_dedup=args.world_space_enable_track_dedup,
+        world_space_enable_detection_dedup=args.world_space_enable_detection_dedup,
+        world_space_prefilter_max_range_m=args.world_space_prefilter_max_range_m,
+        world_space_deduplication_min_distance_m=args.world_space_deduplication_min_distance_m,
+        world_space_deduplication_max_distance_m=args.world_space_deduplication_max_distance_m,
+        world_space_deduplication_min_speed_diff_mps=args.world_space_deduplication_min_speed_diff_mps,
+        world_space_deduplication_max_speed_diff_mps=args.world_space_deduplication_max_speed_diff_mps,
+        world_space_track_similarity_position_weight=args.world_space_track_similarity_position_weight,
+        world_space_track_similarity_direction_weight=args.world_space_track_similarity_direction_weight,
+        world_space_track_similarity_speed_weight=args.world_space_track_similarity_speed_weight,
+        world_space_track_similarity_score_threshold=args.world_space_track_similarity_score_threshold,
+        world_space_detection_similarity_score_threshold=args.world_space_detection_similarity_score_threshold,
     )
     print(f"[sort-ws] World-space KF model: {args.world_space_kf_model}")
     print(f"[sort-ws] Q intensity: {args.world_space_q_intensity}")

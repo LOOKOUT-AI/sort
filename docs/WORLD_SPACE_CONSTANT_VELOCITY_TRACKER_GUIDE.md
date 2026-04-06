@@ -23,11 +23,13 @@ At a high level, each frame goes through this sequence:
 1. Start with raw detector bounding boxes and per-detection metadata.
 2. Convert each usable detection into a world-space ENU point measurement.
 3. Predict every existing internal track forward with a constant-velocity Kalman filter.
-4. Associate current detections to predicted tracks in ENU meters.
-5. Update matched tracks with the new measurement.
-6. Spawn new tracks from unmatched detections that pass the birth gate.
-7. Emit matched tracks, rewarming tracks, and ghost tracks for downstream consumers.
-8. Delete stale tracks that have missed too many frames.
+4. Optionally pre-filter predicted tracks and detections by ego-relative ENU range.
+5. Optionally de-duplicate detections and predicted tracks before association.
+6. Associate the surviving unique detections to the surviving unique predicted tracks in ENU meters.
+7. Update matched tracks with the new measurement.
+8. Spawn new tracks from unmatched unique detections that pass the birth gate.
+9. Emit matched tracks, rewarming tracks, and ghost tracks for downstream consumers.
+10. Delete stale tracks that have missed too many frames.
 
 The important design choice is that the filter does not track image-space bounding boxes. It tracks a 2D point in local ENU meters.
 
@@ -41,9 +43,12 @@ flowchart TD
     worldDets[WorldDetections]
     assignCall[WorldSpaceSortAssign]
     predictTracks[PredictExistingTracks]
-    associateStep[AssociateDetectionsToTracks]
+    prefilterStep[OptionalRangePrefilter]
+    detDedupStep[OptionalDetectionDedup]
+    trkDedupStep[OptionalTrackDedup]
+    associateStep[AssociateUniqueDetectionsToUniqueTracks]
     matchedUpdate[UpdateMatchedTracks]
-    birthStep[CreateNewTracksFromUnmatchedDetections]
+    birthStep[CreateNewTracksFromUnmatchedUniqueDetections]
     unmatchedOutputs[BuildUnmatchedOutputs]
     pruneStep[PruneExpiredTracks]
     bridgePack[BridgePackagesOutputPayload]
@@ -54,7 +59,10 @@ flowchart TD
     projectWorld --> worldDets
     worldDets --> assignCall
     assignCall --> predictTracks
-    predictTracks --> associateStep
+    predictTracks --> prefilterStep
+    prefilterStep --> detDedupStep
+    detDedupStep --> trkDedupStep
+    trkDedupStep --> associateStep
     associateStep --> matchedUpdate
     associateStep --> birthStep
     associateStep --> unmatchedOutputs
@@ -77,7 +85,8 @@ For the constant-velocity path, `_track_world_space()` is the key function:
 - returns an empty result until ego latitude/longitude, heading, and local ENU reference are available
 - skips detections that do not have usable `x`, `width` or `w`, and positive `distance`
 - converts each surviving detection into world-space fields
-- calls `world_tracker.assign(world_dets)`
+- computes current ego ENU from the local reference
+- calls `world_tracker.assign(world_dets, ego_enu_from_ref=...)`
 - packages the matched and unmatched outputs back into the outgoing bbox payload
 
 `_process_video_payload()` then decides whether `vm.metadata["bboxes"]` should carry image-space results or world-space results.
@@ -206,6 +215,12 @@ In other words, ENU is the tracker's working coordinate system, while latitude/l
 
 After projection, the bridge passes `world_dets` into `WorldSpaceSort.assign()`.
 
+`assign()` now also receives the current ego ENU position relative to the same local reference so the tracker can:
+
+- pre-filter detections by ego-relative range
+- pre-filter predicted tracks by ego-relative range
+- keep those range decisions aligned to the current predicted frame instead of the previous frame
+
 Inside the world tracker, `_det_to_xy()` extracts the measurement and tracker metadata from each detection:
 
 - measurement position: `world_east_m`, `world_north_m`
@@ -218,6 +233,17 @@ For the constant-velocity tracker, the measurement vector is always:
 - `z = [east, north]`
 
 The measurement is a point in world space, not a bounding box.
+
+Before Hungarian association, the tracker can now run two optional cleanup stages on the current frame:
+
+- range pre-filtering
+  - detections and predicted tracks are filtered independently against `prefilter_max_range_m`
+  - both comparisons use the same current-frame ego ENU reference
+- de-duplication
+  - detections are clustered by ENU distance similarity
+  - predicted tracks are clustered by a weighted combination of position, direction, and speed-difference similarity
+  - only the first processed member of each cluster survives into Hungarian association
+  - duplicate tracks are suppressed from association and downstream output, but remain internal so they can age out naturally
 
 ## Step 4: Constant-Velocity Kalman Filter Internals
 
