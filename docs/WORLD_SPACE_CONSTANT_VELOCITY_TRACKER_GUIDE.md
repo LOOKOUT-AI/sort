@@ -285,6 +285,16 @@ This matters because the tracker is not assuming a fixed frame rate. It uses act
 - `_DEFAULT_DT_S = 1/30` on first use
 - `_MAX_DT_S = 2.0` as a safety clamp for long pauses, seeks, or reconnects
 
+### Timing Source
+
+The elapsed `dt` comes from the local process wall clock, specifically `time.monotonic()` inside the tracker. It is measured when `WorldSpaceSort.assign()` processes each batch of detections.
+
+The tracker does not currently use detection timestamps, synced JSON timestamps, UTC timestamps, or replay media timestamps as the Kalman filter clock. Those timestamps may exist in upstream metadata, but the KF time step is based on receive/processing cadence in the SORT bridge.
+
+This also means replay timing affects the tracker indirectly. If a replay script emits video payloads at the original recording cadence, `dt` should roughly match that cadence. If replay is sped up, paused, seeking, delayed by processing, or affected by websocket jitter, the tracker sees that through the spacing between received payloads. A seek does not by itself reset the Kalman filter state or jump the tracker to a media timestamp.
+
+The image-space tracker follows the same receive-time pattern for its own `dt`, although its `Q` matrix is empirical pixel-space tuning rather than the world-space physics-based process noise model.
+
 ### Measurement Model
 
 The observation model `H` only reads out position from the state:

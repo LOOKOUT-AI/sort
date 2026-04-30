@@ -936,7 +936,7 @@ async def run_bridge(
         for s in sim_servers:
             await s.wait_closed()
 
-
+# eg: python sort-3d.py --mode auto --log-every-n-frames 10 --world-space-kf-model cv
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="SORT websocket bridge: consume replay streams, run SORT, re-broadcast with tracker IDs."
@@ -1191,7 +1191,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--log-every-n-frames",
         type=int,
-        default=0,
+        default=10,
         help="If > 0, print a progress line every N upstream video frames (includes tracker frame_count / max_age).",
     )
     p.add_argument(
