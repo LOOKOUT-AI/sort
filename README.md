@@ -251,7 +251,7 @@ The bridge connects to upstream websocket servers (typically a replay process) a
 
 Downstream defaults:
 - **video**: `ws://0.0.0.0:5002`
-- **nmea**: `ws://0.0.0.0:3637`
+- **nmea**: `ws://0.0.0.0:3640`
 - **control**: `ws://0.0.0.0:6002`
 
 ### Enter venv

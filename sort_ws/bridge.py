@@ -1153,7 +1153,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--downstream-bind", type=str, default="0.0.0.0")
     p.add_argument("--downstream-video-port", type=int, default=5002)
-    p.add_argument("--downstream-nmea-port", type=int, default=3637)
+    p.add_argument("--downstream-nmea-port", type=int, default=3640)
     p.add_argument("--downstream-control-port", type=int, default=6002)
     p.add_argument("--metadata-bind", type=str, default="0.0.0.0")
     p.add_argument("--metadata-port", type=int, default=5010)
