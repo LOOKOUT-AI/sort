@@ -14,8 +14,8 @@ from websockets.server import WebSocketServerProtocol
 
 from .codec import decode_video_message, encode_video_message
 from .ego import EgoSmoother, EgoStateStore
-from .image_space_tracker import ImageSpaceSort
-from .world_space_tracker import WorldSpaceSort
+from .image_space_tracker import ImageSpaceSort, KalmanBoxTracker
+from .world_space_tracker import WorldSpaceSort, KalmanCVPointTracker, KalmanCAPointTracker
 from .image_to_world import detection_to_world_latlon, enu_to_latlon, latlon_to_enu_m, ENU
 from .path_planner import PathPlannerRuntime
 from .world_to_image import world_to_image_space
@@ -32,6 +32,9 @@ class BridgeConfig:
     downstream_video_port: int
     downstream_nmea_port: int
     downstream_control_port: int
+    metadata_bind: str = "0.0.0.0"
+    metadata_port: int = 5010
+    enable_metadata_ws: bool = True
 
     reconnect_delay_s: float = 1.0
 
@@ -205,6 +208,88 @@ def _filtered_bboxes_for_tracking(
             continue
         filtered.append(bbox)
     return filtered
+
+
+def _metadata_bboxes_for_tracking(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_bboxes = metadata.get("bboxes")
+    if isinstance(raw_bboxes, list):
+        return [dict(bbox) for bbox in raw_bboxes if isinstance(bbox, dict)]
+
+    raw_detections = metadata.get("detections")
+    if not isinstance(raw_detections, list):
+        return []
+
+    bboxes: List[Dict[str, Any]] = []
+    for det in raw_detections:
+        if not isinstance(det, dict):
+            continue
+        bbox = det.get("bbox")
+        det2 = dict(det)
+        if isinstance(bbox, dict):
+            det2.pop("bbox", None)
+            det2["x"] = bbox.get("x", det2.get("x", 0))
+            det2["y"] = bbox.get("y", det2.get("y", 0))
+            det2["width"] = bbox.get("width", bbox.get("w", det2.get("width", det2.get("w", 0))))
+            det2["height"] = bbox.get("height", bbox.get("h", det2.get("height", det2.get("h", 0))))
+        bboxes.append(det2)
+    return bboxes
+
+
+def _reset_tracker_runtime(image_tracker: ImageSpaceSort, world_tracker: Optional[WorldSpaceSort]) -> None:
+    image_tracker.trackers.clear()
+    image_tracker.frame_count = 0
+    image_tracker._last_assign_time = None
+    KalmanBoxTracker.count = 0
+
+    if world_tracker is not None:
+        world_tracker.trackers.clear()
+        world_tracker.frame_count = 0
+        world_tracker._last_assign_time = None
+        KalmanCVPointTracker.count = 0
+        KalmanCAPointTracker.count = 0
+
+
+def _metadata_frame_number(metadata: Dict[str, Any], fallback: int) -> int:
+    for key in ("frame_number", "frame_id", "sort_sequence"):
+        try:
+            value = int(metadata.get(key))
+        except Exception:
+            continue
+        return value
+    return fallback
+
+
+def _log_tracking_progress(
+    *,
+    cfg: BridgeConfig,
+    frame_counter: List[int],
+    source_label: str,
+    selected_space: str,
+    image_tracker: ImageSpaceSort,
+    world_tracker: Optional[WorldSpaceSort],
+) -> None:
+    if not cfg.log_every_n_frames or frame_counter[0] % int(cfg.log_every_n_frames) != 0:
+        return
+    active = world_tracker if (selected_space == "world_space" and world_tracker is not None) else image_tracker
+    active_counts = _summarize_tracker_states(active)
+    try:
+        active_frame_count = int(getattr(active, "frame_count", -1))
+    except Exception:
+        active_frame_count = -1
+    try:
+        active_max_age = int(getattr(active, "max_age", -1))
+    except Exception:
+        active_max_age = -1
+    print(
+        f"[sort-ws] [{source_label}] frames={frame_counter[0]} "
+        f"tracker_frames={active_frame_count} "
+        f"tracks={active_counts['tracks']} "
+        f"warming_unconfirmed={active_counts['warming_unconfirmed']} "
+        f"matched={active_counts['matched']} "
+        f"rewarming={active_counts['rewarming']} "
+        f"ghost={active_counts['ghost']} "
+        f"max_age={active_max_age}"
+    )
 
 
 def _parse_bool_arg(value: Any) -> bool:
@@ -425,8 +510,8 @@ async def _track_world_space(
     
     return tracked_bboxes
 
-async def _process_video_payload(
-    payload: bytes,
+async def _track_metadata_payload(
+    metadata: Dict[str, Any],
     *,
     cfg: BridgeConfig,
     mode_state: TrackingModeState,
@@ -434,17 +519,13 @@ async def _process_video_payload(
     world_tracker: Optional[WorldSpaceSort],
     ego_store: Optional[EgoStateStore],
     path_planner: Optional[PathPlannerRuntime],
-    video_hub: BroadcastHub,
     frame_counter: List[int],
     runtime_state: SharedTrackerRuntimeState,
     source_label: str = "upstream",
-) -> None:
-    """Shared tracking pipeline for both upstream replay and simulation ingestion."""
+) -> Dict[str, Any]:
+    """Run SORT and path planning on metadata independent of transport format."""
     frame_counter[0] += 1
-    vm = decode_video_message(payload)
-    bboxes = vm.metadata.get("bboxes", [])
-    if not isinstance(bboxes, list):
-        bboxes = []
+    bboxes = _metadata_bboxes_for_tracking(metadata)
     bboxes_for_tracking = _filtered_bboxes_for_tracking(bboxes, runtime_state)
 
     # Always compute image-space tracks.
@@ -465,7 +546,7 @@ async def _process_video_payload(
         ego = await ego_store.get()
         if ego.heading_deg is not None and ego.enu_from_ref is not None and ego.ref_latlon is not None:
             result = await path_planner.compute(
-                frame_number=frame_counter[0],
+                frame_number=_metadata_frame_number(metadata, frame_counter[0]),
                 ego_enu=ego.enu_from_ref,
                 ego_ref_latlon=ego.ref_latlon,
                 ego_heading_deg=float(ego.heading_deg),
@@ -491,36 +572,56 @@ async def _process_video_payload(
             tracked_bboxes = tracked_world
             selected_space = "world_space"
 
-    vm.metadata["bboxes"] = tracked_bboxes
-    vm.metadata["tracked"] = True
+    out_metadata = dict(metadata)
+    out_metadata["bboxes"] = tracked_bboxes
+    out_metadata["tracked"] = True
+    out_metadata["tracked_source"] = "sort"
     if path_planning_payload is not None:
-        vm.metadata["path_planning"] = path_planning_payload
+        out_metadata["path_planning"] = path_planning_payload
     else:
-        vm.metadata.pop("path_planning", None)
-    out_payload = encode_video_message(vm.metadata, vm.jpeg_bytes)
-    await video_hub.broadcast(out_payload)
+        out_metadata.pop("path_planning", None)
 
-    if cfg.log_every_n_frames and frame_counter[0] % int(cfg.log_every_n_frames) == 0:
-        active = world_tracker if (selected_space == "world_space" and world_tracker is not None) else image_tracker
-        active_counts = _summarize_tracker_states(active)
-        try:
-            active_frame_count = int(getattr(active, "frame_count", -1))
-        except Exception:
-            active_frame_count = -1
-        try:
-            active_max_age = int(getattr(active, "max_age", -1))
-        except Exception:
-            active_max_age = -1
-        print(
-            f"[sort-ws] [{source_label}] frames={frame_counter[0]} "
-            f"tracker_frames={active_frame_count} "
-            f"tracks={active_counts['tracks']} "
-            f"warming_unconfirmed={active_counts['warming_unconfirmed']} "
-            f"matched={active_counts['matched']} "
-            f"rewarming={active_counts['rewarming']} "
-            f"ghost={active_counts['ghost']} "
-            f"max_age={active_max_age}"
-        )
+    _log_tracking_progress(
+        cfg=cfg,
+        frame_counter=frame_counter,
+        source_label=source_label,
+        selected_space=selected_space,
+        image_tracker=image_tracker,
+        world_tracker=world_tracker,
+    )
+    return out_metadata
+
+
+async def _process_video_payload(
+    payload: bytes,
+    *,
+    cfg: BridgeConfig,
+    mode_state: TrackingModeState,
+    image_tracker: ImageSpaceSort,
+    world_tracker: Optional[WorldSpaceSort],
+    ego_store: Optional[EgoStateStore],
+    path_planner: Optional[PathPlannerRuntime],
+    video_hub: BroadcastHub,
+    frame_counter: List[int],
+    runtime_state: SharedTrackerRuntimeState,
+    source_label: str = "upstream",
+) -> None:
+    """Shared tracking pipeline for both upstream replay and simulation ingestion."""
+    vm = decode_video_message(payload)
+    tracked_metadata = await _track_metadata_payload(
+        vm.metadata,
+        cfg=cfg,
+        mode_state=mode_state,
+        image_tracker=image_tracker,
+        world_tracker=world_tracker,
+        ego_store=ego_store,
+        path_planner=path_planner,
+        frame_counter=frame_counter,
+        runtime_state=runtime_state,
+        source_label=source_label,
+    )
+    out_payload = encode_video_message(tracked_metadata, vm.jpeg_bytes)
+    await video_hub.broadcast(out_payload)
 
 
 async def _upstream_video_loop(
@@ -831,6 +932,86 @@ async def _sim_nmea_handler(
         print(f"[sort-ws] Simulation NMEA client disconnected ({msg_count} messages)")
 
 
+async def _metadata_ws_handler(
+    ws: WebSocketServerProtocol,
+    *,
+    cfg: BridgeConfig,
+    mode_state: TrackingModeState,
+    image_tracker: ImageSpaceSort,
+    world_tracker: Optional[WorldSpaceSort],
+    ego_store: Optional[EgoStateStore],
+    path_planner: Optional[PathPlannerRuntime],
+    runtime_state: SharedTrackerRuntimeState,
+) -> None:
+    """Accept raw WebRTC metadata JSON and reply with tracked metadata JSON."""
+    print("[sort-ws] Metadata client connected")
+    _reset_tracker_runtime(image_tracker, world_tracker)
+    frame_counter = [0]
+    latest_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+
+    async def reader() -> None:
+        async for msg in ws:
+            if isinstance(msg, (bytes, bytearray)):
+                print("[sort-ws] Metadata websocket ignores binary messages")
+                continue
+            msg_s = str(msg)
+            if latest_queue.full():
+                try:
+                    latest_queue.get_nowait()
+                    latest_queue.task_done()
+                except asyncio.QueueEmpty:
+                    pass
+            await latest_queue.put(msg_s)
+
+    async def processor() -> None:
+        while True:
+            msg_s = await latest_queue.get()
+            try:
+                try:
+                    metadata = json.loads(msg_s)
+                except Exception as exc:
+                    print(f"[sort-ws] Dropping malformed metadata JSON: {exc}")
+                    continue
+                if not isinstance(metadata, dict):
+                    print("[sort-ws] Dropping metadata message that is not a JSON object")
+                    continue
+                tracked_metadata = await _track_metadata_payload(
+                    metadata,
+                    cfg=cfg,
+                    mode_state=mode_state,
+                    image_tracker=image_tracker,
+                    world_tracker=world_tracker,
+                    ego_store=ego_store,
+                    path_planner=path_planner,
+                    frame_counter=frame_counter,
+                    runtime_state=runtime_state,
+                    source_label="metadata",
+                )
+                await ws.send(json.dumps(tracked_metadata, separators=(",", ":")))
+            except ConnectionClosed:
+                raise
+            except Exception as exc:
+                print(f"[sort-ws] Failed to process metadata message: {exc}")
+            finally:
+                latest_queue.task_done()
+
+    reader_task = asyncio.create_task(reader())
+    processor_task = asyncio.create_task(processor())
+    try:
+        done, pending = await asyncio.wait(
+            {reader_task, processor_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            task.result()
+    except ConnectionClosed:
+        pass
+    finally:
+        for task in (reader_task, processor_task):
+            task.cancel()
+        print(f"[sort-ws] Metadata client disconnected (processed {frame_counter[0]} frames)")
+
+
 async def run_bridge(
     cfg: BridgeConfig,
     image_tracker: ImageSpaceSort,
@@ -905,10 +1086,30 @@ async def run_bridge(
         )
         sim_servers.append(sim_nmea_server)
 
+    metadata_server = None
+    if cfg.enable_metadata_ws:
+        metadata_server = await websockets.serve(
+            lambda ws: _metadata_ws_handler(
+                ws,
+                cfg=cfg,
+                mode_state=mode_state,
+                image_tracker=image_tracker,
+                world_tracker=world_tracker,
+                ego_store=ego_store,
+                path_planner=path_planner,
+                runtime_state=runtime_state,
+            ),
+            cfg.metadata_bind,
+            cfg.metadata_port,
+            max_size=None,
+        )
+
     print("[sort-ws] Starting downstream websocket servers:")
     print(f"  video   ws://{cfg.downstream_bind}:{cfg.downstream_video_port}")
     print(f"  nmea    ws://{cfg.downstream_bind}:{cfg.downstream_nmea_port}")
     print(f"  control ws://{cfg.downstream_bind}:{cfg.downstream_control_port}")
+    if cfg.enable_metadata_ws:
+        print(f"  metadata ws://{cfg.metadata_bind}:{cfg.metadata_port}")
     if cfg.sim_video_port:
         print(f"  sim-video ws://{cfg.downstream_bind}:{cfg.sim_video_port}")
     if cfg.sim_nmea_port:
@@ -928,11 +1129,15 @@ async def run_bridge(
         video_server.close()
         nmea_server.close()
         control_server.close()
+        if metadata_server is not None:
+            metadata_server.close()
         for s in sim_servers:
             s.close()
         await video_server.wait_closed()
         await nmea_server.wait_closed()
         await control_server.wait_closed()
+        if metadata_server is not None:
+            await metadata_server.wait_closed()
         for s in sim_servers:
             await s.wait_closed()
 
@@ -950,6 +1155,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--downstream-video-port", type=int, default=5002)
     p.add_argument("--downstream-nmea-port", type=int, default=3637)
     p.add_argument("--downstream-control-port", type=int, default=6002)
+    p.add_argument("--metadata-bind", type=str, default="0.0.0.0")
+    p.add_argument("--metadata-port", type=int, default=5010)
+    p.add_argument(
+        "--enable-metadata-ws",
+        type=_parse_bool_arg,
+        default=True,
+        help="Serve metadata-only request/response websocket for WebRTC detections.",
+    )
 
     # Image-space tracker params (shown in --help)
     p.add_argument("--image-space-max-age", dest="image_space_max_age", type=int, default=40)
@@ -1216,6 +1429,9 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         downstream_video_port=args.downstream_video_port,
         downstream_nmea_port=args.downstream_nmea_port,
         downstream_control_port=args.downstream_control_port,
+        metadata_bind=args.metadata_bind,
+        metadata_port=int(args.metadata_port),
+        enable_metadata_ws=bool(args.enable_metadata_ws),
         reconnect_delay_s=args.reconnect_delay_s,
         mode=mode,
         world_space_cv_width_px=int(args.world_space_cv_width_px),
