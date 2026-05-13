@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 import sys
+import time
 from dataclasses import dataclass
 from typing import Optional, Set, List, Dict, Any
 
@@ -144,6 +145,22 @@ class PlaybackInfoCache:
             return self._playback_info
 
 
+class SortTrackerStatusStore:
+    """Cache the latest compact tracker status for downstream control clients."""
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._status: Optional[Dict[str, Any]] = None
+
+    async def update(self, status: Dict[str, Any]) -> None:
+        async with self._lock:
+            self._status = dict(status)
+
+    async def get(self) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            return dict(self._status) if self._status is not None else None
+
+
 def _ws_url(host: str, port: int) -> str:
     return f"ws://{host}:{port}"
 
@@ -186,6 +203,65 @@ def _summarize_tracker_states(tracker: Any) -> Dict[str, int]:
         else:
             counts["warming_unconfirmed"] += 1
     return counts
+
+
+def _safe_int_attr(obj: Any, attr: str, default: int = -1) -> int:
+    try:
+        return int(getattr(obj, attr, default))
+    except Exception:
+        return default
+
+
+def _ego_status_payload(ego: Any) -> Dict[str, bool]:
+    has_position = bool(getattr(ego, "latlon", None) is not None)
+    has_heading = bool(getattr(ego, "heading_deg", None) is not None)
+    has_ref = bool(getattr(ego, "ref_latlon", None) is not None)
+    has_enu = bool(getattr(ego, "enu_from_ref", None) is not None)
+    return {
+        "ego_ready": has_position and has_heading and has_ref and has_enu,
+        "ego_has_position": has_position,
+        "ego_has_heading": has_heading,
+        "ego_has_ref": has_ref,
+        "ego_has_enu": has_enu,
+    }
+
+
+def _tracker_status_payload(
+    *,
+    source_label: str,
+    frame_count: int,
+    requested_mode: str,
+    actual_mode: str,
+    image_tracker: ImageSpaceSort,
+    world_tracker: Optional[WorldSpaceSort],
+    ego_status: Dict[str, bool],
+    input_detections: int,
+    tracked_outputs: int,
+    world_outputs: int,
+    active_tracker: Any,
+    runtime_state: SharedTrackerRuntimeState,
+) -> Dict[str, Any]:
+    return {
+        "enabled": True,
+        "source": source_label,
+        "frame_count": int(frame_count),
+        "requested_mode": requested_mode,
+        "actual_mode": actual_mode,
+        "world_space_available": world_outputs > 0,
+        "input_detections": int(input_detections),
+        "tracked_outputs": int(tracked_outputs),
+        "world_outputs": int(world_outputs),
+        "image_tracker_counts": _summarize_tracker_states(image_tracker),
+        "world_tracker_counts": _summarize_tracker_states(world_tracker) if world_tracker is not None else None,
+        "tracker_counts": _summarize_tracker_states(active_tracker),
+        "active_max_age": _safe_int_attr(active_tracker, "max_age"),
+        "active_min_hits": _safe_int_attr(active_tracker, "min_hits"),
+        "image_min_hits": _safe_int_attr(image_tracker, "min_hits"),
+        "world_min_hits": _safe_int_attr(world_tracker, "min_hits") if world_tracker is not None else -1,
+        "input_min_confidence": float(getattr(runtime_state, "input_min_confidence", 0.0) or 0.0),
+        "updated_at_ms": int(time.time() * 1000),
+        **ego_status,
+    }
 
 
 def _filtered_bboxes_for_tracking(
@@ -521,6 +597,8 @@ async def _track_metadata_payload(
     path_planner: Optional[PathPlannerRuntime],
     frame_counter: List[int],
     runtime_state: SharedTrackerRuntimeState,
+    status_store: Optional[SortTrackerStatusStore] = None,
+    control_hub: Optional[BroadcastHub] = None,
     source_label: str = "upstream",
 ) -> Dict[str, Any]:
     """Run SORT and path planning on metadata independent of transport format."""
@@ -542,8 +620,8 @@ async def _track_metadata_payload(
         )
 
     path_planning_payload: Optional[Dict[str, Any]] = None
-    if path_planner is not None and ego_store is not None:
-        ego = await ego_store.get()
+    ego = await ego_store.get() if ego_store is not None else None
+    if path_planner is not None and ego is not None:
         if ego.heading_deg is not None and ego.enu_from_ref is not None and ego.ref_latlon is not None:
             result = await path_planner.compute(
                 frame_number=_metadata_frame_number(metadata, frame_counter[0]),
@@ -572,10 +650,27 @@ async def _track_metadata_payload(
             tracked_bboxes = tracked_world
             selected_space = "world_space"
 
+    active_tracker = world_tracker if (selected_space == "world_space" and world_tracker is not None) else image_tracker
+    status = _tracker_status_payload(
+        source_label=source_label,
+        frame_count=frame_counter[0],
+        requested_mode=mode,
+        actual_mode=selected_space,
+        image_tracker=image_tracker,
+        world_tracker=world_tracker,
+        ego_status=_ego_status_payload(ego),
+        input_detections=len(bboxes_for_tracking),
+        tracked_outputs=len(tracked_bboxes),
+        world_outputs=len(tracked_world),
+        active_tracker=active_tracker,
+        runtime_state=runtime_state,
+    )
+
     out_metadata = dict(metadata)
     out_metadata["bboxes"] = tracked_bboxes
     out_metadata["tracked"] = True
     out_metadata["tracked_source"] = "sort"
+    out_metadata["sort_tracker_status"] = status
     if path_planning_payload is not None:
         out_metadata["path_planning"] = path_planning_payload
     else:
@@ -589,6 +684,10 @@ async def _track_metadata_payload(
         image_tracker=image_tracker,
         world_tracker=world_tracker,
     )
+    if status_store is not None:
+        await status_store.update(status)
+    if control_hub is not None:
+        await control_hub.broadcast(json.dumps({"sort_tracker_status": status}, separators=(",", ":")))
     return out_metadata
 
 
@@ -604,6 +703,8 @@ async def _process_video_payload(
     video_hub: BroadcastHub,
     frame_counter: List[int],
     runtime_state: SharedTrackerRuntimeState,
+    status_store: Optional[SortTrackerStatusStore] = None,
+    control_hub: Optional[BroadcastHub] = None,
     source_label: str = "upstream",
 ) -> None:
     """Shared tracking pipeline for both upstream replay and simulation ingestion."""
@@ -618,6 +719,8 @@ async def _process_video_payload(
         path_planner=path_planner,
         frame_counter=frame_counter,
         runtime_state=runtime_state,
+        status_store=status_store,
+        control_hub=control_hub,
         source_label=source_label,
     )
     out_payload = encode_video_message(tracked_metadata, vm.jpeg_bytes)
@@ -633,6 +736,8 @@ async def _upstream_video_loop(
     path_planner: Optional[PathPlannerRuntime],
     video_hub: BroadcastHub,
     runtime_state: SharedTrackerRuntimeState,
+    status_store: Optional[SortTrackerStatusStore],
+    control_hub: BroadcastHub,
 ) -> None:
     url = _ws_url(cfg.upstream_host, cfg.upstream_video_port)
     frame_counter = [0]
@@ -654,6 +759,8 @@ async def _upstream_video_loop(
                         video_hub=video_hub,
                         frame_counter=frame_counter,
                         runtime_state=runtime_state,
+                        status_store=status_store,
+                        control_hub=control_hub,
                         source_label="upstream",
                     )
         except asyncio.CancelledError:
@@ -748,6 +855,7 @@ async def _downstream_control_handler(
     world_tracker: Optional[WorldSpaceSort] = None,
     path_planner: Optional[PathPlannerRuntime] = None,
     runtime_state: Optional[SharedTrackerRuntimeState] = None,
+    status_store: Optional[SortTrackerStatusStore] = None,
 ) -> None:
     await control_hub.register(ws)
     try:
@@ -775,6 +883,14 @@ async def _downstream_control_handler(
         try:
             if path_planner is not None:
                 await ws.send(json.dumps({"path_planning_params": await path_planner.get_params()}))
+        except Exception:
+            pass
+
+        try:
+            if status_store is not None:
+                status = await status_store.get()
+                if status is not None:
+                    await ws.send(json.dumps({"sort_tracker_status": status}))
         except Exception:
             pass
 
@@ -815,6 +931,25 @@ async def _downstream_control_handler(
                     # Always forward upstream so clients can refresh playback_info
                     # (cache may be stale, e.g. total_frames=0 before video loads).
                     await outbound_to_upstream.put(msg_s)
+                    continue
+                if cmd == "get_sort_tracker_status":
+                    if status_store is not None:
+                        try:
+                            status = await status_store.get()
+                            if status is not None:
+                                await ws.send(json.dumps({"sort_tracker_status": status}))
+                            else:
+                                await ws.send(json.dumps({
+                                    "sort_tracker_status": {
+                                        "enabled": True,
+                                        "source": "control",
+                                        "message": "waiting_for_frames",
+                                        "requested_mode": await mode_state.get(),
+                                        "updated_at_ms": int(time.time() * 1000),
+                                    }
+                                }))
+                        except Exception:
+                            pass
                     continue
 
                 # --- Tracker param commands (intercepted, NOT forwarded upstream) ---
@@ -884,6 +1019,8 @@ async def _sim_video_handler(
     path_planner: Optional[PathPlannerRuntime],
     video_hub: BroadcastHub,
     runtime_state: SharedTrackerRuntimeState,
+    status_store: Optional[SortTrackerStatusStore],
+    control_hub: BroadcastHub,
 ) -> None:
     """Accept video+bbox messages from the frontend simulator."""
     print("[sort-ws] Simulation video client connected")
@@ -902,7 +1039,9 @@ async def _sim_video_handler(
                 path_planner=path_planner,
                 video_hub=video_hub,
                 frame_counter=frame_counter,
-                        runtime_state=runtime_state,
+                runtime_state=runtime_state,
+                status_store=status_store,
+                control_hub=control_hub,
                 source_label="sim",
             )
     except ConnectionClosed:
@@ -942,6 +1081,8 @@ async def _metadata_ws_handler(
     ego_store: Optional[EgoStateStore],
     path_planner: Optional[PathPlannerRuntime],
     runtime_state: SharedTrackerRuntimeState,
+    status_store: Optional[SortTrackerStatusStore],
+    control_hub: BroadcastHub,
 ) -> None:
     """Accept raw WebRTC metadata JSON and reply with tracked metadata JSON."""
     print("[sort-ws] Metadata client connected")
@@ -985,6 +1126,8 @@ async def _metadata_ws_handler(
                     path_planner=path_planner,
                     frame_counter=frame_counter,
                     runtime_state=runtime_state,
+                    status_store=status_store,
+                    control_hub=control_hub,
                     source_label="metadata",
                 )
                 await ws.send(json.dumps(tracked_metadata, separators=(",", ":")))
@@ -1024,6 +1167,7 @@ async def run_bridge(
     outbound_to_upstream: asyncio.Queue[str] = asyncio.Queue()
     mode_state = TrackingModeState(cfg.mode)
     playback_cache = PlaybackInfoCache()
+    status_store = SortTrackerStatusStore()
     path_planner = PathPlannerRuntime()
     runtime_state = SharedTrackerRuntimeState(input_min_confidence=float(cfg.input_min_confidence))
 
@@ -1050,6 +1194,7 @@ async def run_bridge(
             world_tracker,
             path_planner,
             runtime_state,
+            status_store,
         ),
         cfg.downstream_bind,
         cfg.downstream_control_port,
@@ -1070,6 +1215,8 @@ async def run_bridge(
                 path_planner=path_planner,
                 video_hub=video_hub,
                 runtime_state=runtime_state,
+                status_store=status_store,
+                control_hub=control_hub,
             ),
             cfg.downstream_bind,
             cfg.sim_video_port,
@@ -1098,6 +1245,8 @@ async def run_bridge(
                 ego_store=ego_store,
                 path_planner=path_planner,
                 runtime_state=runtime_state,
+                status_store=status_store,
+                control_hub=control_hub,
             ),
             cfg.metadata_bind,
             cfg.metadata_port,
@@ -1121,7 +1270,18 @@ async def run_bridge(
 
     try:
         await asyncio.gather(
-            _upstream_video_loop(cfg, mode_state, image_tracker, world_tracker, ego_store, path_planner, video_hub, runtime_state),
+            _upstream_video_loop(
+                cfg,
+                mode_state,
+                image_tracker,
+                world_tracker,
+                ego_store,
+                path_planner,
+                video_hub,
+                runtime_state,
+                status_store,
+                control_hub,
+            ),
             _upstream_nmea_loop(cfg, nmea_hub, ego_store),
             _upstream_control_loop(cfg, control_hub, outbound_to_upstream, playback_cache),
         )
