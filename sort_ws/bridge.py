@@ -1326,7 +1326,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Image-space tracker params (shown in --help)
     p.add_argument("--image-space-max-age", dest="image_space_max_age", type=int, default=40)
-    p.add_argument("--image-space-min-hits", dest="image_space_min_hits", type=int, default=300)
+    p.add_argument("--image-space-min-hits", dest="image_space_min_hits", type=int, default=5)
     p.add_argument("--image-space-iou-threshold", dest="image_space_iou_threshold", type=float, default=0.1)
     p.add_argument("--image-space-alpha-distance", dest="image_space_alpha_distance", type=float, default=0.15)
     p.add_argument("--image-space-beta-heading", dest="image_space_beta_heading", type=float, default=0.0)
